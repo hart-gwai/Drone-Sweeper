@@ -1,0 +1,21 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.qrc_extras.dat
+*.pyc
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# QGIS / packaging
+*.zip
+help/build/
+*.qml~
+*.bak
+
+# Local test outputs
+_test_output/

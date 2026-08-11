@@ -1,0 +1,23 @@
+[general]
+name=Drone Sweeper
+qgisMinimumVersion=3.16
+qgisMaximumVersion=3.99
+description=Generate SAR area-search grids and OSM linear features, export DJI Pilot 2-compatible KML flight plans
+version=1.0.0
+author=Drone Sweeper
+email=support@dronesweeper.local
+about=Drone Sweeper prepares Search and Rescue (SAR) flight plans from an AOI polygon. It builds spreadsheet-named grid cells, fetches trails and waterways from OpenStreetMap via the Overpass API, names unnamed features using MGRS midpoints, exports individual KML files for DJI Pilot 2, and organizes results in the QGIS layer tree.
+tracker=https://github.com/dronesweeper/drone-sweeper/issues
+repository=https://github.com/dronesweeper/drone-sweeper
+homepage=https://github.com/dronesweeper/drone-sweeper
+category=Vector
+icon=icons/icon.svg
+experimental=False
+deprecated=False
+tags=sar,drone,kml,dji,grid,osm,overpass,mgrs,search and rescue
+hasProcessingProvider=False
+supportsQt6=False
+plugin_dependencies=
+server=False
+changelog=
+    1.0.0 - Initial release: AOI grids, OSM linear fetch, MGRS naming, DJI Pilot 2 KML export
