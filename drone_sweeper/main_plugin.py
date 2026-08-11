@@ -55,12 +55,15 @@ class DroneSweeperPlugin:
             "Generate SAR area grids and OSM linear features; export DJI Pilot 2 KML."
         )
         action.triggered.connect(self.run)
+        # Plugins menu (what most users look for) + Vector menu (metadata category)
+        self.iface.addPluginToMenu(self.menu, action)
         self.iface.addPluginToVectorMenu(self.menu, action)
         self.toolbar.addAction(action)
         self.actions.append(action)
 
     def unload(self):
         for action in self.actions:
+            self.iface.removePluginMenu(self.menu, action)
             self.iface.removePluginVectorMenu(self.menu, action)
             if self.toolbar is not None:
                 self.toolbar.removeAction(action)
@@ -182,10 +185,10 @@ class DroneSweeperPlugin:
         project_dir = ensure_project_directory()
 
         set_progress(5, "Creating output folders…")
-        _root, area_dir, linear_dir = build_output_folders(project_dir, polygon_name)
+        flight_dir, area_dir, linear_dir = build_output_folders(project_dir, polygon_name)
 
         def grid_cb(done, total, msg):
-            pct = 5 + int(35 * (done / max(total, 1)))
+            pct = 5 + int(30 * (done / max(total, 1)))
             set_progress(pct, msg)
 
         set_progress(8, "Generating search grid…")
@@ -193,23 +196,22 @@ class DroneSweeperPlugin:
             layer, grid_size, polygon_name, progress_callback=grid_cb
         )
 
-        set_progress(42, "Exporting grid cell KML files…")
+        set_progress(38, "Exporting grid cell KML files…")
 
         def kml_grid_cb(done, total, msg):
-            pct = 42 + int(28 * (done / max(total, 1)))
+            pct = 38 + int(22 * (done / max(total, 1)))
             set_progress(pct, msg)
 
         area_files = export_features_as_individual_kml(
             grid_layer, "name", area_dir, progress_callback=kml_grid_cb
         )
 
-        linear_layer = None
-        linear_files = []
+        linear_files: list = []
         if fetch_trails or fetch_waterways:
-            set_progress(72, "Fetching OpenStreetMap features…")
+            set_progress(62, "Fetching OpenStreetMap features…")
 
             def osm_msg(msg: str):
-                set_progress(74, msg)
+                set_progress(64, msg)
 
             clipped = fetch_and_clip_osm(
                 layer,
@@ -217,13 +219,13 @@ class DroneSweeperPlugin:
                 fetch_waterways=fetch_waterways,
                 progress_callback=osm_msg,
             )
-            set_progress(82, "Naming linear features (MGRS)…")
+            set_progress(72, "Naming linear features (MGRS)…")
             linear_layer = name_linear_features(clipped, polygon_name)
 
-            set_progress(86, "Exporting linear feature KML files…")
+            set_progress(75, "Exporting linear feature KML files…")
 
             def kml_lin_cb(done, total, msg):
-                pct = 86 + int(10 * (done / max(total, 1)))
+                pct = 75 + int(8 * (done / max(total, 1)))
                 set_progress(pct, msg)
 
             if linear_layer.featureCount() > 0:
@@ -234,12 +236,22 @@ class DroneSweeperPlugin:
                     progress_callback=kml_lin_cb,
                 )
             else:
-                set_progress(94, "No OSM linear features found inside the AOI.")
+                set_progress(82, "No OSM linear features found inside the AOI.")
         else:
-            set_progress(90, "Skipping OSM download (both toggles off).")
+            set_progress(80, "Skipping OSM download (both toggles off).")
 
-        set_progress(96, "Organizing QGIS layer groups…")
-        organize_layer_tree(polygon_name, grid_layer, linear_layer)
+        set_progress(84, "Loading KML files into the layer panel…")
+
+        def tree_cb(done, total, msg):
+            pct = 84 + int(15 * (done / max(total, 1)))
+            set_progress(pct, msg)
+
+        organize_layer_tree(
+            polygon_name,
+            area_files,
+            linear_files,
+            progress_callback=tree_cb,
+        )
 
         set_progress(100, "Done.")
         n_lin = len(linear_files)
@@ -247,6 +259,7 @@ class DroneSweeperPlugin:
         return (
             f"Exported {n_area} area-search KML file(s) and {n_lin} linear-search "
             f"KML file(s) for “{polygon_name}”.\n\n"
+            f"Flight Plan: {flight_dir}\n"
             f"Area Search: {area_dir}\n"
             f"Linear Search: {linear_dir}"
         )

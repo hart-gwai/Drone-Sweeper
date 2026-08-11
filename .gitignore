@@ -19,3 +19,6 @@ help/build/
 
 # Local test outputs
 _test_output/
+
+dist/
+

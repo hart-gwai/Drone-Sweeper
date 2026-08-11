@@ -16,17 +16,21 @@ from qgis.core import (
     QgsFeature,
     QgsField,
     QgsFields,
+    QgsFillSymbol,
     QgsGeometry,
     QgsLayerTreeGroup,
     QgsLayerTreeLayer,
+    QgsLineSymbol,
     QgsPointXY,
     QgsProject,
     QgsRectangle,
+    QgsSingleSymbolRenderer,
     QgsVectorFileWriter,
     QgsVectorLayer,
     QgsWkbTypes,
 )
 from qgis.PyQt.QtCore import QVariant
+from qgis.PyQt.QtGui import QColor
 
 from .mgrs_converter import format_feature_name
 from .osm_fetcher import line_midpoint_xy, transform_geometry, union_aoi_geometry
@@ -102,15 +106,20 @@ def ensure_project_directory() -> str:
 
 
 def build_output_folders(project_dir: str, polygon_name: str) -> Tuple[str, str, str]:
-    """Create and return (root, area_search_dir, linear_search_dir)."""
+    """Create and return (flight_plan_dir, area_search_dir, linear_search_dir).
+
+    Layout (adjacent to the saved project file)::
+
+        <Project_Directory>/Flight Plan_<polygon_name>/Area Search_<polygon_name>/
+        <Project_Directory>/Flight Plan_<polygon_name>/Linear Search_<polygon_name>/
+    """
     safe = sanitize_filename(polygon_name)
-    root = os.path.join(project_dir, safe)
-    flight = os.path.join(root, f"Flight Plan_{safe}")
+    flight = os.path.join(project_dir, f"Flight Plan_{safe}")
     area_dir = os.path.join(flight, f"Area Search_{safe}")
     linear_dir = os.path.join(flight, f"Linear Search_{safe}")
     os.makedirs(area_dir, exist_ok=True)
     os.makedirs(linear_dir, exist_ok=True)
-    return root, area_dir, linear_dir
+    return flight, area_dir, linear_dir
 
 
 def generate_grid_layer(
@@ -434,12 +443,117 @@ def clear_group_layers(group: QgsLayerTreeGroup) -> None:
         project.removeMapLayers(to_remove)
 
 
+def load_kml_layer(kml_path: str) -> Optional[QgsVectorLayer]:
+    """Open an on-disk KML as an OGR vector layer (not a memory scratch layer)."""
+    layer_name = os.path.splitext(os.path.basename(kml_path))[0]
+    layer = QgsVectorLayer(kml_path, layer_name, "ogr")
+    if not layer.isValid():
+        return None
+    return layer
+
+
+# Distinct colours for linear SAR features (readable on imagery / OSM basemaps)
+_LINEAR_COLORS = (
+    QColor(0, 120, 255),    # blue
+    QColor(0, 170, 80),     # green
+    QColor(255, 140, 0),    # orange
+    QColor(160, 60, 200),   # purple
+    QColor(0, 190, 200),    # cyan
+    QColor(220, 50, 50),    # red
+    QColor(230, 190, 0),    # gold
+    QColor(30, 30, 30),     # near-black
+    QColor(255, 80, 160),   # magenta/pink
+    QColor(90, 60, 20),     # brown
+)
+
+
+def style_area_grid_layer(layer: QgsVectorLayer) -> None:
+    """Red outline + red fill at 50% opacity for area-search grid cells."""
+    symbol = QgsFillSymbol.createSimple(
+        {
+            "color": "255,0,0,128",  # 50% opaque red fill
+            "style": "solid",
+            "outline_color": "220,0,0,255",
+            "outline_width": "0.4",
+            "outline_style": "solid",
+        }
+    )
+    layer.setRenderer(QgsSingleSymbolRenderer(symbol))
+    layer.triggerRepaint()
+
+
+def style_linear_layer(layer: QgsVectorLayer, color_index: int = 0) -> None:
+    """Thick coloured stroke for linear-search features; cycles a colour palette."""
+    color = _LINEAR_COLORS[color_index % len(_LINEAR_COLORS)]
+    symbol = QgsLineSymbol.createSimple(
+        {
+            "line_color": f"{color.red()},{color.green()},{color.blue()},255",
+            "line_width": "2.0",
+            "line_width_unit": "MM",
+            "line_style": "solid",
+            "capstyle": "round",
+            "joinstyle": "round",
+        }
+    )
+    symbol.setWidth(2.0)
+    symbol.setColor(color)
+    layer.setRenderer(QgsSingleSymbolRenderer(symbol))
+    layer.triggerRepaint()
+
+
+def add_kml_files_to_group(
+    group: QgsLayerTreeGroup,
+    kml_paths: List[str],
+    style: str = "none",
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
+) -> int:
+    """Add each KML path as its own project layer under ``group``. Returns count added.
+
+    :param style: ``"area"`` (red 50% fill), ``"linear"`` (thick multi-colour), or ``"none"``
+    """
+    project = QgsProject.instance()
+    added = 0
+    total = len(kml_paths)
+    batch: List[QgsVectorLayer] = []
+
+    def _style_and_attach(layers: List[QgsVectorLayer], start_index: int) -> None:
+        project.addMapLayers(layers, False)
+        for offset, lyr in enumerate(layers):
+            if style == "area":
+                style_area_grid_layer(lyr)
+            elif style == "linear":
+                style_linear_layer(lyr, start_index + offset)
+            group.addLayer(lyr)
+
+    for i, path in enumerate(kml_paths, start=1):
+        layer = load_kml_layer(path)
+        if layer is None:
+            continue
+        batch.append(layer)
+        # Flush in chunks so the UI stays responsive on large grids
+        if len(batch) >= 50:
+            _style_and_attach(batch, added)
+            added += len(batch)
+            batch = []
+            if progress_callback:
+                progress_callback(i, total, f"Adding KML layers ({i}/{total})…")
+
+    if batch:
+        _style_and_attach(batch, added)
+        added += len(batch)
+
+    if progress_callback and total:
+        progress_callback(total, total, f"Added {added} KML layer(s).")
+    return added
+
+
 def organize_layer_tree(
     polygon_name: str,
-    grid_layer: QgsVectorLayer,
-    linear_layer: Optional[QgsVectorLayer],
+    area_kml_paths: List[str],
+    linear_kml_paths: Optional[List[str]] = None,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
 ) -> None:
-    """Add results under Flight Plan_<name> / Area Search / Linear Search groups."""
+    """Load exported KML files into Flight Plan / Area Search / Linear Search groups."""
     safe = sanitize_name(polygon_name)
     root = QgsProject.instance().layerTreeRoot()
     flight_group = get_or_create_group(root, f"Flight Plan_{safe}")
@@ -450,28 +564,23 @@ def organize_layer_tree(
     clear_group_layers(area_group)
     clear_group_layers(linear_group)
 
-    QgsProject.instance().addMapLayer(grid_layer, False)
-    area_group.addLayer(grid_layer)
+    area_total = len(area_kml_paths)
+    linear_paths = linear_kml_paths or []
+    grand_total = max(area_total + len(linear_paths), 1)
 
-    if linear_layer is not None and linear_layer.featureCount() > 0:
-        QgsProject.instance().addMapLayer(linear_layer, False)
-        linear_group.addLayer(linear_layer)
+    def area_cb(done, total, msg):
+        if progress_callback:
+            progress_callback(done, grand_total, msg)
 
-    # Labels for grid cells
-    try:
-        from qgis.core import QgsPalLayerSettings, QgsTextFormat, QgsVectorLayerSimpleLabeling
-        from qgis.PyQt.QtGui import QColor, QFont
+    add_kml_files_to_group(
+        area_group, area_kml_paths, style="area", progress_callback=area_cb
+    )
 
-        settings = QgsPalLayerSettings()
-        settings.fieldName = "name"
-        settings.isExpression = False
-        settings.enabled = True
-        text_format = QgsTextFormat()
-        text_format.setFont(QFont("Arial", 8))
-        text_format.setSize(8)
-        text_format.setColor(QColor(20, 40, 30))
-        settings.setFormat(text_format)
-        grid_layer.setLabeling(QgsVectorLayerSimpleLabeling(settings))
-        grid_layer.setLabelsEnabled(True)
-    except Exception:
-        pass
+    if linear_paths:
+        def linear_cb(done, total, msg):
+            if progress_callback:
+                progress_callback(area_total + done, grand_total, msg)
+
+        add_kml_files_to_group(
+            linear_group, linear_paths, style="linear", progress_callback=linear_cb
+        )
