@@ -6,11 +6,13 @@ OpenStreetMap Overpass API fetcher and AOI clipper for Drone Sweeper.
 from __future__ import annotations
 
 import json
+import math
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from qgis.core import (
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
+    QgsCsException,
     QgsFeature,
     QgsField,
     QgsFields,
@@ -18,6 +20,7 @@ from qgis.core import (
     QgsNetworkAccessManager,
     QgsPointXY,
     QgsProject,
+    QgsRectangle,
     QgsVectorLayer,
     QgsWkbTypes,
 )
@@ -28,27 +31,114 @@ OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 
 TRAIL_HIGHWAYS = ("path", "footway", "track", "steps", "bridleway", "cycleway")
 WATERWAY_TYPES = ("stream", "river", "canal", "drain")
+POWER_LINE_TYPES = ("line", "minor_line", "cable")
+POWER_POINT_TYPES = ("tower", "pole", "portal")
 
 
 class OsmFetchError(Exception):
     """Raised when an Overpass query or parse step fails."""
 
 
+def _is_finite_extent(extent: QgsRectangle) -> bool:
+    """True if rectangle has finite, non-empty coordinates."""
+    if extent is None or extent.isEmpty():
+        return False
+    vals = (
+        extent.xMinimum(),
+        extent.xMaximum(),
+        extent.yMinimum(),
+        extent.yMaximum(),
+    )
+    return all(math.isfinite(v) for v in vals)
+
+
+def layer_feature_extent(layer: QgsVectorLayer) -> QgsRectangle:
+    """Compute extent from features (more reliable than cached layer.extent())."""
+    rect = QgsRectangle()
+    rect.setNull()
+    count = 0
+    for feat in layer.getFeatures():
+        geom = feat.geometry()
+        if geom is None or geom.isEmpty():
+            continue
+        gext = geom.boundingBox()
+        if not _is_finite_extent(gext):
+            continue
+        if rect.isNull():
+            rect = QgsRectangle(gext)
+        else:
+            rect.combineExtentWith(gext)
+        count += 1
+    if count == 0 or not _is_finite_extent(rect):
+        raise OsmFetchError(
+            f"Layer “{layer.name()}” has no valid geometries to build a bounding box from."
+        )
+    return rect
+
+
 def polygon_layer_bbox_wgs84(layer: QgsVectorLayer) -> Tuple[float, float, float, float]:
-    """Return (south, west, north, east) WGS84 bbox covering all features."""
-    extent = layer.extent()
+    """Return (south, west, north, east) WGS84 bbox covering all features.
+
+    Rebuilds extent from features and validates CRS/transform so invalid
+    cached extents (inf/nan — common with some KML/OGR layers) do not crash.
+    """
     src_crs = layer.crs()
+    if not src_crs.isValid():
+        raise OsmFetchError(
+            f"Layer “{layer.name()}” has no valid coordinate reference system. "
+            "Set the layer CRS (e.g. EPSG:4326 or a local projected CRS) and try again."
+        )
+
+    # Prefer feature-derived extent; fall back to layer.extent() only if finite
+    try:
+        extent = layer_feature_extent(layer)
+    except OsmFetchError:
+        extent = layer.extent()
+        if not _is_finite_extent(extent):
+            raise
+
     wgs84 = QgsCoordinateReferenceSystem("EPSG:4326")
     if src_crs != wgs84:
-        xform = QgsCoordinateTransform(src_crs, wgs84, QgsProject.instance())
-        extent = xform.transformBoundingBox(extent)
-    # Overpass expects south,west,north,east
-    return (
-        extent.yMinimum(),
-        extent.xMinimum(),
-        extent.yMaximum(),
-        extent.xMaximum(),
-    )
+        try:
+            xform = QgsCoordinateTransform(src_crs, wgs84, QgsProject.instance())
+            # Transform corners individually for robustness with geographic/projected mixes
+            extent = xform.transformBoundingBox(extent)
+        except QgsCsException as exc:
+            raise OsmFetchError(
+                f"Could not reproject “{layer.name()}” ({src_crs.authid() or src_crs.description()}) "
+                f"to WGS84 for the OSM query.\n{exc}\n\n"
+                "Check that the layer CRS matches the data, or reproject/export the AOI to EPSG:4326."
+            ) from exc
+
+    if not _is_finite_extent(extent):
+        raise OsmFetchError(
+            f"WGS84 bounding box for “{layer.name()}” is invalid (infinite or empty). "
+            "The layer CRS may not match the geometry coordinates."
+        )
+
+    south, west = extent.yMinimum(), extent.xMinimum()
+    north, east = extent.yMaximum(), extent.xMaximum()
+
+    # Sanity: Overpass needs geographic degrees
+    if not (-90.0 <= south <= 90.0 and -90.0 <= north <= 90.0):
+        raise OsmFetchError(
+            f"Latitude out of range after transform ({south}, {north}). "
+            "The AOI layer CRS is likely wrong for its coordinates."
+        )
+    if not (-180.0 <= west <= 180.0 and -180.0 <= east <= 180.0):
+        # Allow slight wrap padding later; still flag clearly broken values
+        if abs(west) > 360 or abs(east) > 360:
+            raise OsmFetchError(
+                f"Longitude out of range after transform ({west}, {east}). "
+                "The AOI layer CRS is likely wrong for its coordinates."
+            )
+
+    return south, west, north, east
+
+
+def _padded_bbox(south: float, west: float, north: float, east: float) -> str:
+    pad = 0.0005  # ~50 m padding to catch edge crossings
+    return f"{south - pad},{west - pad},{north + pad},{east + pad}"
 
 
 def build_overpass_query(
@@ -63,10 +153,7 @@ def build_overpass_query(
     if not fetch_trails and not fetch_waterways:
         raise OsmFetchError("At least one OSM feature type must be enabled.")
 
-    pad = 0.0005  # ~50 m padding to catch edge crossings
-    s, w, n, e = south - pad, west - pad, north + pad, east + pad
-    bbox = f"{s},{w},{n},{e}"
-
+    bbox = _padded_bbox(south, west, north, east)
     parts: List[str] = []
     if fetch_trails:
         highway_re = "|".join(TRAIL_HIGHWAYS)
@@ -80,6 +167,28 @@ def build_overpass_query(
 [out:json][timeout:90];
 (
   {body}
+);
+out body;
+>;
+out skel qt;
+""".strip()
+
+
+def build_hazards_overpass_query(
+    south: float,
+    west: float,
+    north: float,
+    east: float,
+) -> str:
+    """Overpass QL for power lines and pylons/poles (drone obstacle awareness)."""
+    bbox = _padded_bbox(south, west, north, east)
+    line_re = "|".join(POWER_LINE_TYPES)
+    point_re = "|".join(POWER_POINT_TYPES)
+    return f"""
+[out:json][timeout:90];
+(
+  way["power"~"{line_re}"]({bbox});
+  node["power"~"{point_re}"]({bbox});
 );
 out body;
 >;
@@ -402,3 +511,141 @@ def fetch_and_clip_osm(
     if progress_callback:
         progress_callback("Clipping OSM features to AOI…")
     return clip_lines_to_polygon(raw_layer, aoi_geom, aoi_layer.crs())
+
+
+def _classify_power_tags(tags: dict) -> Optional[Tuple[str, str, str]]:
+    """Return (label, geom_kind, power_value) where geom_kind is 'point' or 'line'."""
+    power = (tags.get("power") or "").strip()
+    if power in POWER_POINT_TYPES:
+        label = {"tower": "Pylon", "pole": "Power Pole", "portal": "Power Portal"}.get(
+            power, power.capitalize()
+        )
+        return label, "point", power
+    if power in POWER_LINE_TYPES:
+        label = {
+            "line": "Power Line",
+            "minor_line": "Minor Power Line",
+            "cable": "Power Cable",
+        }.get(power, "Power Line")
+        return label, "line", power
+    return None
+
+
+def osm_hazards_to_memory_layers(
+    osm_data: dict,
+) -> Tuple[QgsVectorLayer, QgsVectorLayer]:
+    """Convert Overpass JSON into WGS84 point + line memory layers for power hazards."""
+    point_layer = QgsVectorLayer("Point?crs=EPSG:4326", "Power Pylons", "memory")
+    line_layer = QgsVectorLayer("LineString?crs=EPSG:4326", "Power Lines", "memory")
+
+    def _init_fields(layer: QgsVectorLayer) -> None:
+        fields = QgsFields()
+        fields.append(QgsField("osm_id", QVariant.LongLong))
+        fields.append(QgsField("name", QVariant.String))
+        fields.append(QgsField("feature_type", QVariant.String))
+        fields.append(QgsField("power", QVariant.String))
+        fields.append(QgsField("voltage", QVariant.String))
+        layer.dataProvider().addAttributes(fields)
+        layer.updateFields()
+
+    _init_fields(point_layer)
+    _init_fields(line_layer)
+
+    elements = osm_data.get("elements", [])
+    nodes = _nodes_index(elements)
+    point_feats: List[QgsFeature] = []
+    line_feats: List[QgsFeature] = []
+
+    for el in elements:
+        tags = el.get("tags", {}) or {}
+        classified = _classify_power_tags(tags)
+        if not classified:
+            continue
+        label, kind, power = classified
+        name = tags.get("name") or label
+        voltage = str(tags.get("voltage") or "")
+
+        if kind == "point" and el.get("type") == "node":
+            lon = el.get("lon")
+            lat = el.get("lat")
+            if lon is None or lat is None:
+                continue
+            feat = QgsFeature(point_layer.fields())
+            feat.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(float(lon), float(lat))))
+            feat.setAttribute("osm_id", el.get("id"))
+            feat.setAttribute("name", name)
+            feat.setAttribute("feature_type", label)
+            feat.setAttribute("power", power)
+            feat.setAttribute("voltage", voltage)
+            point_feats.append(feat)
+        elif kind == "line" and el.get("type") == "way":
+            geom = _way_to_geometry(el, nodes)
+            if geom is None or geom.isEmpty():
+                continue
+            feat = QgsFeature(line_layer.fields())
+            feat.setGeometry(geom)
+            feat.setAttribute("osm_id", el.get("id"))
+            feat.setAttribute("name", name)
+            feat.setAttribute("feature_type", label)
+            feat.setAttribute("power", power)
+            feat.setAttribute("voltage", voltage)
+            line_feats.append(feat)
+
+    if point_feats:
+        point_layer.dataProvider().addFeatures(point_feats)
+    if line_feats:
+        line_layer.dataProvider().addFeatures(line_feats)
+    point_layer.updateExtents()
+    line_layer.updateExtents()
+    return point_layer, line_layer
+
+
+def clip_points_to_polygon(
+    point_layer: QgsVectorLayer,
+    aoi_geom_src: QgsGeometry,
+    aoi_crs: QgsCoordinateReferenceSystem,
+) -> QgsVectorLayer:
+    """Keep points that fall inside the AOI."""
+    pt_crs = point_layer.crs()
+    aoi = transform_geometry(aoi_geom_src, aoi_crs, pt_crs)
+    out = QgsVectorLayer(
+        f"Point?crs={pt_crs.authid()}",
+        f"{point_layer.name()} (clipped)",
+        "memory",
+    )
+    provider = out.dataProvider()
+    provider.addAttributes(point_layer.fields())
+    out.updateFields()
+    kept: List[QgsFeature] = []
+    for feat in point_layer.getFeatures():
+        geom = feat.geometry()
+        if geom is None or geom.isEmpty():
+            continue
+        if geom.within(aoi) or geom.intersects(aoi):
+            new_feat = QgsFeature(out.fields())
+            new_feat.setGeometry(QgsGeometry(geom))
+            new_feat.setAttributes(feat.attributes())
+            kept.append(new_feat)
+    if kept:
+        provider.addFeatures(kept)
+    out.updateExtents()
+    return out
+
+
+def fetch_and_clip_hazards(
+    aoi_layer: QgsVectorLayer,
+    progress_callback: Optional[Callable[[str], None]] = None,
+) -> Tuple[QgsVectorLayer, QgsVectorLayer]:
+    """Fetch OSM power lines/pylons and clip to AOI. Returns (points, lines)."""
+    south, west, north, east = polygon_layer_bbox_wgs84(aoi_layer)
+    query = build_hazards_overpass_query(south, west, north, east)
+    data = fetch_overpass_json(query, progress_callback=progress_callback)
+    if progress_callback:
+        progress_callback("Building power hazard layers…")
+    points, lines = osm_hazards_to_memory_layers(data)
+    aoi_geom = union_aoi_geometry(aoi_layer)
+    if progress_callback:
+        progress_callback("Clipping power hazards to AOI…")
+    clipped_points = clip_points_to_polygon(points, aoi_geom, aoi_layer.crs())
+    clipped_lines = clip_lines_to_polygon(lines, aoi_geom, aoi_layer.crs())
+    return clipped_points, clipped_lines

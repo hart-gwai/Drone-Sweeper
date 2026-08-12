@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <!-- Warning triangle for power / obstacle hazards -->
+  <polygon points="32,6 58,54 6,54" fill="#f4c430" stroke="#c0392b" stroke-width="4" stroke-linejoin="round"/>
+  <rect x="28" y="24" width="8" height="18" rx="1" fill="#1a1a1a"/>
+  <circle cx="32" cy="48" r="3.5" fill="#1a1a1a"/>
+</svg>

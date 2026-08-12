@@ -13,18 +13,19 @@ from qgis.PyQt.QtCore import QCoreApplication, Qt
 from qgis.PyQt.QtGui import QIcon
 from qgis.PyQt.QtWidgets import QAction, QMessageBox, QProgressDialog
 
-from .drone_sweeper_dialog import DroneSweeperDialog
+from .drone_sweeper_dialog import MODE_AREA, MODE_LINEAR, DroneSweeperDialog
 from .processing_engine import (
     ProcessingError,
     build_output_folders,
     ensure_project_directory,
     export_features_as_individual_kml,
+    export_hazards_as_gpx,
     generate_grid_layer,
     name_linear_features,
     organize_layer_tree,
     sanitize_name,
 )
-from .osm_fetcher import OsmFetchError, fetch_and_clip_osm
+from .osm_fetcher import OsmFetchError, fetch_and_clip_hazards, fetch_and_clip_osm
 
 
 class DroneSweeperPlugin:
@@ -39,9 +40,6 @@ class DroneSweeperPlugin:
         self.dialog = None
         self._cancel_requested = False
 
-    # ------------------------------------------------------------------ #
-    # QGIS plugin lifecycle
-    # ------------------------------------------------------------------ #
     def initGui(self):
         icon_path = os.path.join(self.plugin_dir, "icons", "icon.svg")
         icon = QIcon(icon_path) if os.path.exists(icon_path) else QIcon()
@@ -55,7 +53,6 @@ class DroneSweeperPlugin:
             "Generate SAR area grids and OSM linear features; export DJI Pilot 2 KML."
         )
         action.triggered.connect(self.run)
-        # Plugins menu (what most users look for) + Vector menu (metadata category)
         self.iface.addPluginToMenu(self.menu, action)
         self.iface.addPluginToVectorMenu(self.menu, action)
         self.toolbar.addAction(action)
@@ -75,9 +72,6 @@ class DroneSweeperPlugin:
             self.dialog.close()
             self.dialog = None
 
-    # ------------------------------------------------------------------ #
-    # UI entry
-    # ------------------------------------------------------------------ #
     def run(self):
         if self.dialog is None:
             self.dialog = DroneSweeperDialog(self.iface.mainWindow())
@@ -93,9 +87,7 @@ class DroneSweeperPlugin:
             return
 
         layer = self.dialog.selected_layer()
-        grid_size = self.dialog.grid_size_meters()
-        fetch_trails = self.dialog.fetch_trails()
-        fetch_waterways = self.dialog.fetch_waterways()
+        mode = self.dialog.current_mode()
         polygon_name = sanitize_name(layer.name())
 
         self._cancel_requested = False
@@ -121,14 +113,21 @@ class DroneSweeperPlugin:
             QCoreApplication.processEvents()
 
         try:
-            summary = self._execute(
-                layer=layer,
-                polygon_name=polygon_name,
-                grid_size=grid_size,
-                fetch_trails=fetch_trails,
-                fetch_waterways=fetch_waterways,
-                set_progress=set_progress,
-            )
+            if mode == MODE_AREA:
+                summary = self._execute_area(
+                    layer=layer,
+                    polygon_name=polygon_name,
+                    grid_size=self.dialog.grid_size_meters(),
+                    set_progress=set_progress,
+                )
+            else:
+                summary = self._execute_linear(
+                    layer=layer,
+                    polygon_name=polygon_name,
+                    fetch_trails=self.dialog.fetch_trails(),
+                    fetch_waterways=self.dialog.fetch_waterways(),
+                    set_progress=set_progress,
+                )
             progress.setValue(100)
             progress.close()
             self.iface.messageBar().pushMessage(
@@ -138,7 +137,6 @@ class DroneSweeperPlugin:
                 duration=12,
             )
             QMessageBox.information(self.dialog, "Drone Sweeper", summary)
-            self.dialog.accept()
         except ProcessingError as exc:
             progress.close()
             self.iface.messageBar().pushMessage(
@@ -150,12 +148,16 @@ class DroneSweeperPlugin:
             QMessageBox.warning(self.dialog, "Drone Sweeper", str(exc))
         except OsmFetchError as exc:
             progress.close()
-            msg = f"OpenStreetMap fetch failed:\n{exc}"
+            msg = (
+                f"OpenStreetMap fetch failed:\n{exc}\n\n"
+                "Area Search (grid) is separate — switch the mode dropdown to "
+                "generate the grid offline without OSM."
+            )
             self.iface.messageBar().pushMessage(
                 "Drone Sweeper", msg, level=Qgis.Critical, duration=12
             )
             QMessageBox.critical(self.dialog, "Drone Sweeper", msg)
-        except Exception as exc:  # noqa: BLE001 — surface unexpected errors to user
+        except Exception as exc:  # noqa: BLE001
             progress.close()
             detail = f"{exc}\n\n{traceback.format_exc()}"
             self.iface.messageBar().pushMessage(
@@ -169,14 +171,106 @@ class DroneSweeperPlugin:
     def _request_cancel(self):
         self._cancel_requested = True
 
-    # ------------------------------------------------------------------ #
-    # Core pipeline
-    # ------------------------------------------------------------------ #
-    def _execute(
+    def _execute_area(
         self,
         layer: QgsVectorLayer,
         polygon_name: str,
         grid_size: float,
+        set_progress,
+    ) -> str:
+        set_progress(2, "Checking project save location…")
+        project_dir = ensure_project_directory()
+
+        set_progress(5, "Creating Area Search folders…")
+        flight_dir, area_dir, _linear_dir, hazards_dir = build_output_folders(
+            project_dir,
+            polygon_name,
+            create_area=True,
+            create_linear=False,
+            create_hazards=True,
+        )
+
+        def grid_cb(done, total, msg):
+            set_progress(5 + int(35 * (done / max(total, 1))), msg)
+
+        set_progress(8, "Generating MGRS-aligned search grid…")
+        grid_layer = generate_grid_layer(
+            layer, grid_size, polygon_name, progress_callback=grid_cb
+        )
+
+        def kml_cb(done, total, msg):
+            set_progress(42 + int(22 * (done / max(total, 1))), msg)
+
+        set_progress(42, "Exporting grid cell KML files…")
+        area_files = export_features_as_individual_kml(
+            grid_layer, "name", area_dir, progress_callback=kml_cb
+        )
+
+        def tree_cb(done, total, msg):
+            set_progress(66 + int(12 * (done / max(total, 1))), msg)
+
+        set_progress(66, "Loading grid KMLs into the layer panel…")
+        organize_layer_tree(
+            polygon_name,
+            area_kml_paths=area_files,
+            replace_area=True,
+            replace_linear=False,
+            replace_hazards=False,
+            progress_callback=tree_cb,
+        )
+
+        # Best-effort hazards: never fail the Area Search grid if OSM is down
+        hazard_note = ""
+        hazard_files: list = []
+        set_progress(80, "Fetching potential hazards (power lines / pylons)…")
+        try:
+            def haz_msg(msg: str):
+                set_progress(82, msg)
+
+            points, lines = fetch_and_clip_hazards(layer, progress_callback=haz_msg)
+            set_progress(90, "Exporting hazard GPX files…")
+            hazard_files = export_hazards_as_gpx(points, lines, hazards_dir)
+            organize_layer_tree(
+                polygon_name,
+                hazard_gpx_paths=hazard_files,
+                replace_hazards=True,
+            )
+            if hazard_files:
+                n_pt = points.featureCount()
+                n_ln = lines.featureCount()
+                hazard_note = (
+                    f"\nPotential Hazards: {n_pt} pylon/pole(s), {n_ln} power line(s) "
+                    f"→ {hazards_dir}"
+                )
+            else:
+                hazard_note = (
+                    "\nPotential Hazards: no mapped power lines/pylons found in the AOI "
+                    "(OSM coverage may be incomplete)."
+                )
+        except (OsmFetchError, ProcessingError, Exception) as exc:
+            hazard_note = (
+                f"\nPotential Hazards: skipped ({exc}). "
+                "Grid export completed; OSM hazard data needs internet."
+            )
+            self.iface.messageBar().pushMessage(
+                "Drone Sweeper",
+                f"Potential Hazards skipped: {exc}",
+                level=Qgis.Warning,
+                duration=10,
+            )
+
+        set_progress(100, "Done.")
+        return (
+            f"Area Search: exported {len(area_files)} grid KML file(s) for “{polygon_name}”.\n\n"
+            f"Flight Plan: {flight_dir}\n"
+            f"Area Search: {area_dir}"
+            f"{hazard_note}"
+        )
+
+    def _execute_linear(
+        self,
+        layer: QgsVectorLayer,
+        polygon_name: str,
         fetch_trails: bool,
         fetch_waterways: bool,
         set_progress,
@@ -184,82 +278,56 @@ class DroneSweeperPlugin:
         set_progress(2, "Checking project save location…")
         project_dir = ensure_project_directory()
 
-        set_progress(5, "Creating output folders…")
-        flight_dir, area_dir, linear_dir = build_output_folders(project_dir, polygon_name)
-
-        def grid_cb(done, total, msg):
-            pct = 5 + int(30 * (done / max(total, 1)))
-            set_progress(pct, msg)
-
-        set_progress(8, "Generating search grid…")
-        grid_layer = generate_grid_layer(
-            layer, grid_size, polygon_name, progress_callback=grid_cb
+        set_progress(5, "Creating Linear Search folder…")
+        flight_dir, _area_dir, linear_dir, _hazards_dir = build_output_folders(
+            project_dir, polygon_name, create_area=False, create_linear=True
         )
 
-        set_progress(38, "Exporting grid cell KML files…")
+        set_progress(10, "Fetching OpenStreetMap features…")
 
-        def kml_grid_cb(done, total, msg):
-            pct = 38 + int(22 * (done / max(total, 1)))
-            set_progress(pct, msg)
+        def osm_msg(msg: str):
+            set_progress(15, msg)
 
-        area_files = export_features_as_individual_kml(
-            grid_layer, "name", area_dir, progress_callback=kml_grid_cb
+        clipped = fetch_and_clip_osm(
+            layer,
+            fetch_trails=fetch_trails,
+            fetch_waterways=fetch_waterways,
+            progress_callback=osm_msg,
         )
+        set_progress(55, "Naming linear features (MGRS)…")
+        linear_layer = name_linear_features(clipped, polygon_name)
 
         linear_files: list = []
-        if fetch_trails or fetch_waterways:
-            set_progress(62, "Fetching OpenStreetMap features…")
+        if linear_layer.featureCount() > 0:
+            def kml_cb(done, total, msg):
+                set_progress(60 + int(20 * (done / max(total, 1))), msg)
 
-            def osm_msg(msg: str):
-                set_progress(64, msg)
-
-            clipped = fetch_and_clip_osm(
-                layer,
-                fetch_trails=fetch_trails,
-                fetch_waterways=fetch_waterways,
-                progress_callback=osm_msg,
+            set_progress(60, "Exporting linear feature KML files…")
+            linear_files = export_features_as_individual_kml(
+                linear_layer,
+                "export_name",
+                linear_dir,
+                progress_callback=kml_cb,
             )
-            set_progress(72, "Naming linear features (MGRS)…")
-            linear_layer = name_linear_features(clipped, polygon_name)
-
-            set_progress(75, "Exporting linear feature KML files…")
-
-            def kml_lin_cb(done, total, msg):
-                pct = 75 + int(8 * (done / max(total, 1)))
-                set_progress(pct, msg)
-
-            if linear_layer.featureCount() > 0:
-                linear_files = export_features_as_individual_kml(
-                    linear_layer,
-                    "export_name",
-                    linear_dir,
-                    progress_callback=kml_lin_cb,
-                )
-            else:
-                set_progress(82, "No OSM linear features found inside the AOI.")
         else:
-            set_progress(80, "Skipping OSM download (both toggles off).")
-
-        set_progress(84, "Loading KML files into the layer panel…")
+            set_progress(80, "No OSM linear features found inside the AOI.")
 
         def tree_cb(done, total, msg):
-            pct = 84 + int(15 * (done / max(total, 1)))
-            set_progress(pct, msg)
+            set_progress(82 + int(16 * (done / max(total, 1))), msg)
 
+        set_progress(82, "Loading linear KMLs into the layer panel…")
         organize_layer_tree(
             polygon_name,
-            area_files,
-            linear_files,
+            linear_kml_paths=linear_files,
+            replace_area=False,
+            replace_linear=True,
+            replace_hazards=False,
             progress_callback=tree_cb,
         )
 
         set_progress(100, "Done.")
-        n_lin = len(linear_files)
-        n_area = len(area_files)
         return (
-            f"Exported {n_area} area-search KML file(s) and {n_lin} linear-search "
-            f"KML file(s) for “{polygon_name}”.\n\n"
+            f"Linear Search: exported {len(linear_files)} KML file(s) for “{polygon_name}”.\n\n"
             f"Flight Plan: {flight_dir}\n"
-            f"Area Search: {area_dir}\n"
             f"Linear Search: {linear_dir}"
         )

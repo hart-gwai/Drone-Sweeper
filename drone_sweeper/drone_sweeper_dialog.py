@@ -10,6 +10,7 @@ from qgis.gui import QgsMapLayerComboBox
 from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QDialog,
     QDoubleSpinBox,
     QFormLayout,
@@ -18,20 +19,26 @@ from qgis.PyQt.QtWidgets import (
     QLabel,
     QMessageBox,
     QPushButton,
+    QStackedWidget,
     QVBoxLayout,
+    QWidget,
 )
+
+MODE_AREA = "area"
+MODE_LINEAR = "linear"
 
 
 class DroneSweeperDialog(QDialog):
-    """Dockable-style dialog for configuring and launching a flight-plan run."""
+    """Dialog with separate Area Search and Linear Search modes."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Drone Sweeper")
-        self.setMinimumWidth(420)
+        self.setMinimumWidth(440)
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
         self._build_ui()
         self._populate_layers()
+        self._on_mode_changed(0)
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
@@ -41,35 +48,63 @@ class DroneSweeperDialog(QDialog):
         title.setStyleSheet("font-size: 14px; font-weight: 600;")
         root.addWidget(title)
 
-        subtitle = QLabel(
-            "Generate area-search grids and OSM linear features, then export "
-            "DJI Pilot 2–compatible KML files beside your saved project."
+        mode_row = QFormLayout()
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItem("Area Search (Grid)", MODE_AREA)
+        self.mode_combo.addItem("Linear Search (OSM trails / waterways)", MODE_LINEAR)
+        self.mode_combo.setToolTip(
+            "Area Search works offline. Linear Search needs an internet connection "
+            "for the OpenStreetMap Overpass API."
         )
-        subtitle.setWordWrap(True)
-        subtitle.setStyleSheet("color: #555;")
-        root.addWidget(subtitle)
+        mode_row.addRow("Mode:", self.mode_combo)
+        root.addLayout(mode_row)
 
-        form_box = QGroupBox("Inputs")
-        form = QFormLayout(form_box)
-        form.setLabelAlignment(Qt.AlignRight)
-
+        # Shared AOI picker
+        shared = QGroupBox("Area of interest")
+        shared_form = QFormLayout(shared)
         self.layer_combo = QgsMapLayerComboBox()
         self.layer_combo.setFilters(QgsMapLayerProxyModel.PolygonLayer)
         self.layer_combo.setAllowEmptyLayer(False)
-        form.addRow("Input polygon layer:", self.layer_combo)
+        shared_form.addRow("Input polygon layer:", self.layer_combo)
+        root.addWidget(shared)
 
+        self.stack = QStackedWidget()
+
+        # ---- Area Search page ----
+        area_page = QWidget()
+        area_layout = QVBoxLayout(area_page)
+        area_layout.setContentsMargins(0, 0, 0, 0)
+        area_box = QGroupBox("Area Search — MGRS-aligned grid")
+        area_form = QFormLayout(area_box)
         self.grid_size = QDoubleSpinBox()
-        self.grid_size.setRange(1.0, 10000.0)
-        self.grid_size.setDecimals(1)
-        self.grid_size.setSingleStep(5.0)
-        self.grid_size.setValue(50.0)
+        self.grid_size.setRange(10.0, 10000.0)
+        self.grid_size.setDecimals(0)
+        self.grid_size.setSingleStep(10.0)
+        self.grid_size.setValue(100.0)
         self.grid_size.setSuffix(" m")
-        self.grid_size.setToolTip("Grid cell size in meters (e.g. 50 for 50×50 m cells).")
-        form.addRow("Grid size:", self.grid_size)
+        self.grid_size.setToolTip(
+            "Cell size in metres. Must be a multiple of 10 so cells snap to MGRS grid lines. "
+            "Default 100 × 100 m."
+        )
+        area_form.addRow("Grid size:", self.grid_size)
+        area_note = QLabel(
+            "Grid edges snap to MGRS easting/northing lines. "
+            "Cells are named polygon_XY_MGRS (100 m / 6-digit MGRS). "
+            "Also tries to download Potential Hazards (power lines / pylons) as GPX "
+            "when online — grid generation still succeeds offline."
+        )
+        area_note.setWordWrap(True)
+        area_note.setStyleSheet("color: #555; font-size: 11px;")
+        area_form.addRow(area_note)
+        area_layout.addWidget(area_box)
+        area_layout.addStretch(1)
+        self.stack.addWidget(area_page)
 
-        root.addWidget(form_box)
-
-        osm_box = QGroupBox("OpenStreetMap features")
+        # ---- Linear Search page ----
+        linear_page = QWidget()
+        linear_layout = QVBoxLayout(linear_page)
+        linear_layout.setContentsMargins(0, 0, 0, 0)
+        osm_box = QGroupBox("Linear Search — OpenStreetMap features")
         osm_layout = QVBoxLayout(osm_box)
         self.chk_trails = QCheckBox("Paths & Trails (path, footway, track, steps, cycleway…)")
         self.chk_trails.setChecked(True)
@@ -77,19 +112,29 @@ class DroneSweeperDialog(QDialog):
         self.chk_waterways.setChecked(True)
         osm_layout.addWidget(self.chk_trails)
         osm_layout.addWidget(self.chk_waterways)
-        root.addWidget(osm_box)
+        osm_note = QLabel(
+            "Requires internet (Overpass API). If the download fails, Area Search "
+            "grids already generated are left untouched — switch mode to generate the grid offline."
+        )
+        osm_note.setWordWrap(True)
+        osm_note.setStyleSheet("color: #555; font-size: 11px;")
+        osm_layout.addWidget(osm_note)
+        linear_layout.addWidget(osm_box)
+        linear_layout.addStretch(1)
+        self.stack.addWidget(linear_page)
+
+        root.addWidget(self.stack)
 
         tip = QLabel(
-            "Output is written next to the project file under:\n"
-            "Flight Plan_<polygon>/Area Search_<polygon>/ and Linear Search_<polygon>/\n"
-            "Each KML is also loaded into the layer panel (not a temporary layer)."
+            "Output next to the project file:\n"
+            "Flight Plan_<polygon>/Area Search_<polygon>/  and  Linear Search_<polygon>/"
         )
         tip.setWordWrap(True)
         tip.setStyleSheet("color: #666; font-size: 11px;")
         root.addWidget(tip)
 
         btn_row = QHBoxLayout()
-        self.btn_run = QPushButton("Generate & Export Flight Plans")
+        self.btn_run = QPushButton("Generate Area Search")
         self.btn_run.setDefault(True)
         self.btn_run.setMinimumHeight(34)
         self.btn_cancel = QPushButton("Cancel")
@@ -97,11 +142,20 @@ class DroneSweeperDialog(QDialog):
         btn_row.addWidget(self.btn_cancel)
         root.addLayout(btn_row)
 
+        self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
         self.btn_cancel.clicked.connect(self.reject)
 
+    def _on_mode_changed(self, index: int) -> None:
+        self.stack.setCurrentIndex(index)
+        if self.current_mode() == MODE_AREA:
+            self.btn_run.setText("Generate Area Search")
+        else:
+            self.btn_run.setText("Generate Linear Search")
+
+    def current_mode(self) -> str:
+        return self.mode_combo.currentData()
+
     def _populate_layers(self) -> None:
-        """Refresh combo; QgsMapLayerComboBox tracks the project automatically."""
-        # Prefer currently selected polygon layer if any
         layer = self.layer_combo.currentLayer()
         if layer is None:
             for lyr in QgsProject.instance().mapLayers().values():
@@ -128,23 +182,39 @@ class DroneSweeperDialog(QDialog):
     def validate_inputs(self) -> bool:
         layer = self.selected_layer()
         if layer is None:
-            QMessageBox.warning(
-                self,
-                "Drone Sweeper",
-                "Please select an input polygon layer.",
-            )
+            QMessageBox.warning(self, "Drone Sweeper", "Please select an input polygon layer.")
             return False
         if layer.featureCount() == 0:
+            QMessageBox.warning(self, "Drone Sweeper", "The selected layer has no features.")
+            return False
+        if not layer.crs().isValid():
             QMessageBox.warning(
                 self,
                 "Drone Sweeper",
-                "The selected layer has no features.",
+                f"Layer “{layer.name()}” has no valid CRS.\n"
+                "Right-click the layer → Layer CRS → Set Layer CRS… "
+                "(use EPSG:4326 if coordinates are lon/lat).",
             )
             return False
-        if not self.fetch_trails() and not self.fetch_waterways():
-            # Allowed — grid-only run
-            pass
-        if self.grid_size_meters() <= 0:
-            QMessageBox.warning(self, "Drone Sweeper", "Grid size must be greater than zero.")
-            return False
+
+        if self.current_mode() == MODE_AREA:
+            size = self.grid_size_meters()
+            if size < 10:
+                QMessageBox.warning(self, "Drone Sweeper", "Grid size must be at least 10 m.")
+                return False
+            if abs(size % 10.0) > 1e-6:
+                QMessageBox.warning(
+                    self,
+                    "Drone Sweeper",
+                    "Grid size must be a multiple of 10 m so cells line up with MGRS lines.",
+                )
+                return False
+        else:
+            if not self.fetch_trails() and not self.fetch_waterways():
+                QMessageBox.warning(
+                    self,
+                    "Drone Sweeper",
+                    "Enable at least one OpenStreetMap feature type for Linear Search.",
+                )
+                return False
         return True
