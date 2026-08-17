@@ -76,12 +76,20 @@ def col_index_to_letters(index: int) -> str:
 
 
 def extract_xy_from_cell_name(name: str) -> str:
-    """Extract spreadsheet XY token from ``poly_A12_50Q KK 123456`` style names."""
-    m = re.search(r"_([A-Z]+\d+)_\d{1,2}[C-X]\b", name or "")
+    """Extract spreadsheet XY token from feature/layer names.
+
+    Supports ``A12_PolygonName`` (current) and older
+    ``Polygon_A12_50Q KK …`` forms.
+    """
+    text = name or ""
+    m = re.match(r"^([A-Z]+\d+)_", text)
     if m:
         return m.group(1)
-    m = re.search(r"_([A-Z]+\d+)(?:_|\.|$)", name or "")
-    return m.group(1) if m else (name or "")
+    m = re.search(r"_([A-Z]+\d+)_\d{1,2}[C-X]\b", text)
+    if m:
+        return m.group(1)
+    m = re.search(r"_([A-Z]+\d+)(?:_|\.|$)", text)
+    return m.group(1) if m else text
 
 
 def suggest_metric_crs(layer: QgsVectorLayer) -> QgsCoordinateReferenceSystem:
@@ -159,20 +167,30 @@ def build_output_folders(
     create_linear: bool = True,
     create_hazards: bool = False,
 ) -> Tuple[str, str, str, str]:
-    """Create and return (flight, area_dir, linear_dir, hazards_dir)."""
+    """Create and return (flight, area_parent, linear_dir, hazards_dir).
+
+    Area Search KML is written directly into the Flight Plan folder
+    (``Area Search_<polygon>.kml``). Linear Search still uses a subfolder.
+    """
     safe = sanitize_filename(polygon_name)
     flight = os.path.join(project_dir, f"Flight Plan_{safe}")
-    area_dir = os.path.join(flight, f"Area Search_{safe}")
+    area_parent = flight
     linear_dir = os.path.join(flight, f"Linear Search_{safe}")
     hazards_dir = os.path.join(flight, "Potential Hazards")
     os.makedirs(flight, exist_ok=True)
-    if create_area:
-        os.makedirs(area_dir, exist_ok=True)
     if create_linear:
         os.makedirs(linear_dir, exist_ok=True)
     if create_hazards:
         os.makedirs(hazards_dir, exist_ok=True)
-    return flight, area_dir, linear_dir, hazards_dir
+    # create_area only needs the flight folder (already created)
+    _ = create_area
+    return flight, area_parent, linear_dir, hazards_dir
+
+
+def area_search_kml_path(flight_dir: str, polygon_name: str) -> str:
+    """``…/Flight Plan_<poly>/Area Search_<poly>.kml``."""
+    safe = sanitize_filename(polygon_name)
+    return os.path.join(flight_dir, f"Area Search_{safe}.kml")
 
 
 def generate_grid_layer(
@@ -184,7 +202,7 @@ def generate_grid_layer(
     """Build an MGRS-aligned clipped grid.
 
     Cell edges snap to UTM/MGRS metre lines. Size must be a multiple of 10 m.
-    Naming: ``<polygon>_<XY>_<MGRS100m>`` e.g. ``AlphaSector_A1_50Q KK 123456``
+    Feature naming: ``<XY>_<polygon>`` e.g. ``A1_AlphaSector``
     Columns West→East (A…); rows South→North (1…).
     """
     if grid_size_m < 10:
@@ -212,9 +230,10 @@ def generate_grid_layer(
     n_rows = max(1, int(round((y1_limit - y0_origin) / grid_size_m)))
     total = n_cols * n_rows
 
+    safe_poly = sanitize_name(polygon_name)
     layer = QgsVectorLayer(
         f"Polygon?crs={metric_crs.authid()}",
-        f"Area Search_{sanitize_name(polygon_name)}",
+        f"Area Search_{safe_poly}",
         "memory",
     )
     provider = layer.dataProvider()
@@ -233,7 +252,6 @@ def generate_grid_layer(
 
     features: List[QgsFeature] = []
     done = 0
-    safe_poly = sanitize_name(polygon_name)
 
     for col in range(n_cols):
         for row in range(n_rows):
@@ -273,12 +291,12 @@ def generate_grid_layer(
             letters = col_index_to_letters(col_idx)
             xy_label = f"{letters}{row_idx}"
 
-            # MGRS at 100 m (6 digits) from unclipped cell centre
+            # MGRS at 100 m (6 digits) from unclipped cell centre (kept as attribute)
             cx = (x0 + x1) / 2.0
             cy = (y0 + y1) / 2.0
             wgs_pt = to_wgs.transform(QgsPointXY(cx, cy))
             mgrs = latlon_to_mgrs(wgs_pt.y(), wgs_pt.x(), precision=3, spaced=True)
-            cell_name = f"{safe_poly}_{xy_label}_{mgrs}"
+            cell_name = f"{xy_label}_{safe_poly}"
 
             feat = QgsFeature(layer.fields())
             feat.setGeometry(clipped)
@@ -420,28 +438,19 @@ def _line_to_coord_text(
     return " ".join(parts)
 
 
-def build_dji_pilot_kml(
-    name: str,
-    geom_wgs84: QgsGeometry,
-    altitude_m: float = 0.0,
-) -> str:
-    """Minimal KML accepted by DJI Pilot 2 (no Folder; altitude on every vertex).
-
-    Area/mapping import → Polygon. Waypoint / mapping corridor → LineString.
-    """
-    safe_name = xml_escape(name or "FlightPlan")
-    gtype = QgsWkbTypes.geometryType(geom_wgs84.wkbType())
-
-    if gtype == QgsWkbTypes.PolygonGeometry:
-        if QgsWkbTypes.isMultiType(geom_wgs84.wkbType()):
-            polys = geom_wgs84.asMultiPolygon()
-            ring = max(polys, key=lambda p: abs(QgsGeometry.fromPolygonXY(p).area()))[0]
-        else:
-            ring = geom_wgs84.asPolygon()[0]
-        coords = _ring_to_coord_text(ring, altitude_m=altitude_m)
-        if coords.count(",") < 6:  # need ≥3 vertices with lon,lat,alt
-            raise ProcessingError(f"Polygon “{name}” has too few vertices for DJI KML.")
-        geometry_xml = f"""    <Polygon>
+def _polygon_kml_geometry_xml(geom_wgs84: QgsGeometry, altitude_m: float = 0.0) -> str:
+    """Inner Polygon XML block for one WGS84 polygon geometry."""
+    if QgsWkbTypes.geometryType(geom_wgs84.wkbType()) != QgsWkbTypes.PolygonGeometry:
+        raise ProcessingError("Expected polygon geometry for Area Search KML.")
+    if QgsWkbTypes.isMultiType(geom_wgs84.wkbType()):
+        polys = geom_wgs84.asMultiPolygon()
+        ring = max(polys, key=lambda p: abs(QgsGeometry.fromPolygonXY(p).area()))[0]
+    else:
+        ring = geom_wgs84.asPolygon()[0]
+    coords = _ring_to_coord_text(ring, altitude_m=altitude_m)
+    if coords.count(",") < 6:
+        raise ProcessingError("Polygon has too few vertices for DJI KML.")
+    return f"""    <Polygon>
       <tessellate>1</tessellate>
       <altitudeMode>relativeToGround</altitudeMode>
       <outerBoundaryIs>
@@ -450,6 +459,19 @@ def build_dji_pilot_kml(
         </LinearRing>
       </outerBoundaryIs>
     </Polygon>"""
+
+
+def build_dji_pilot_kml(
+    name: str,
+    geom_wgs84: QgsGeometry,
+    altitude_m: float = 0.0,
+) -> str:
+    """Minimal single-feature KML for DJI Pilot 2 (lines / legacy one-offs)."""
+    safe_name = xml_escape(name or "FlightPlan")
+    gtype = QgsWkbTypes.geometryType(geom_wgs84.wkbType())
+
+    if gtype == QgsWkbTypes.PolygonGeometry:
+        geometry_xml = _polygon_kml_geometry_xml(geom_wgs84, altitude_m=altitude_m)
         style = """  <Style id="polyStyle">
     <LineStyle><color>ff0000ff</color><width>1.5</width></LineStyle>
     <PolyStyle><color>7d0000ff</color></PolyStyle>
@@ -461,7 +483,7 @@ def build_dji_pilot_kml(
         else:
             line = geom_wgs84.asPolyline()
         coords = _line_to_coord_text(line, altitude_m=altitude_m)
-        if coords.count(",") < 4:  # need ≥2 vertices
+        if coords.count(",") < 4:
             raise ProcessingError(f"Line “{name}” has too few vertices for DJI KML.")
         geometry_xml = f"""    <LineString>
       <tessellate>1</tessellate>
@@ -499,6 +521,69 @@ def write_dji_kml(kml_path: str, kml_text: str) -> str:
     return kml_path
 
 
+def export_area_search_kml(
+    grid_layer: QgsVectorLayer,
+    out_path: str,
+    altitude_m: float = 0.0,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
+) -> str:
+    """Write one multi-placemark Area Search KML (one Polygon per grid cell)."""
+    doc_name = xml_escape(os.path.splitext(os.path.basename(out_path))[0])
+    features = list(grid_layer.getFeatures())
+    total = len(features)
+    placemarks: List[str] = []
+
+    for i, feat in enumerate(features, start=1):
+        raw_name = str(feat.attribute("name") or f"cell_{i}")
+        geom = feat.geometry()
+        if geom is None or geom.isEmpty():
+            continue
+        if QgsWkbTypes.geometryType(geom.wkbType()) != QgsWkbTypes.PolygonGeometry:
+            continue
+        if QgsWkbTypes.isMultiType(geom.wkbType()):
+            polys = geom.asMultiPolygon() if hasattr(geom, "asMultiPolygon") else []
+            if polys:
+                geom = QgsGeometry.fromPolygonXY(
+                    max(polys, key=lambda p: abs(QgsGeometry.fromPolygonXY(p).area()))
+                )
+        geom_wgs = _reproject_geom_wgs84(geom, grid_layer.crs())
+        try:
+            geom_xml = _polygon_kml_geometry_xml(geom_wgs, altitude_m=altitude_m)
+        except ProcessingError:
+            continue
+        placemarks.append(
+            f"""  <Placemark>
+    <name>{xml_escape(raw_name)}</name>
+    <styleUrl>#polyStyle</styleUrl>
+{geom_xml}
+  </Placemark>"""
+        )
+        if progress_callback and (i % 25 == 0 or i == total):
+            progress_callback(i, total, f"Writing Area Search KML ({i}/{total})…")
+
+    if not placemarks:
+        raise ProcessingError("No grid polygons available to write Area Search KML.")
+
+    kml_text = f"""<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+<Document>
+  <name>{doc_name}</name>
+  <Style id="polyStyle">
+    <LineStyle><color>ff0000ff</color><width>1.5</width></LineStyle>
+    <PolyStyle><color>7d0000ff</color></PolyStyle>
+  </Style>
+{chr(10).join(placemarks)}
+</Document>
+</kml>
+"""
+    if os.path.exists(out_path):
+        os.remove(out_path)
+    write_dji_kml(out_path, kml_text)
+    if progress_callback:
+        progress_callback(total, total, f"Wrote {len(placemarks)} grid polygons to KML.")
+    return out_path
+
+
 def export_features_as_individual_kml(
     layer: QgsVectorLayer,
     name_field: str,
@@ -506,7 +591,7 @@ def export_features_as_individual_kml(
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
     altitude_m: float = 0.0,
 ) -> List[str]:
-    """Export each feature as a DJI Pilot 2–compatible KML. Returns KML paths."""
+    """Export each feature as its own DJI-compatible KML (Linear Search)."""
     written: List[str] = []
     features = list(layer.getFeatures())
     total = len(features)
@@ -546,7 +631,6 @@ def export_features_as_individual_kml(
         try:
             kml_text = build_dji_pilot_kml(str(raw_name), geom_wgs, altitude_m=altitude_m)
         except ProcessingError:
-            # Skip degenerate clipped slivers rather than aborting the whole export
             continue
 
         write_dji_kml(out_path, kml_text)
@@ -637,16 +721,19 @@ def _apply_xy_centroid_label(layer: QgsVectorLayer) -> None:
     except Exception:
         return
 
-    xy = extract_xy_from_cell_name(layer.name())
-    if not xy:
-        return
-
     settings = QgsPalLayerSettings()
     settings.enabled = True
-    settings.isExpression = True
-    settings.fieldName = "'" + xy.replace("'", "''") + "'"
+    # Prefer dedicated label field; else parse Name like A1_PolygonName
+    field_names = [f.name() for f in layer.fields()]
+    if "label" in field_names:
+        settings.isExpression = False
+        settings.fieldName = "label"
+    else:
+        settings.isExpression = True
+        settings.fieldName = (
+            "regexp_substr(coalesce(\"Name\",\"name\"), '^([A-Z]+\\\\d+)')"
+        )
 
-    # Centre of polygon
     placement = getattr(QgsPalLayerSettings, "OverPoint", None)
     if placement is None:
         placement = getattr(QgsPalLayerSettings, "Centroid", None)
@@ -655,7 +742,6 @@ def _apply_xy_centroid_label(layer: QgsVectorLayer) -> None:
     if hasattr(settings, "centroidWhole"):
         settings.centroidWhole = True
 
-    # Hide when zoomed out past ~1:40 000
     settings.scaleVisibility = True
     settings.minimumScale = 40000
     settings.maximumScale = 0
@@ -669,7 +755,6 @@ def _apply_xy_centroid_label(layer: QgsVectorLayer) -> None:
     font.setBold(True)
     text_format.setFont(font)
 
-    # Shrink label size as the user zooms out
     size_expr = (
         "CASE"
         " WHEN @map_scale < 2000 THEN 12"
@@ -765,9 +850,31 @@ def add_kml_files_to_group(
     return added
 
 
+def _remove_direct_layers_named(group: QgsLayerTreeGroup, layer_name: str) -> None:
+    """Remove map layers with ``layer_name`` that sit directly under ``group``."""
+    project = QgsProject.instance()
+    to_remove = []
+    for child in list(group.children()):
+        if isinstance(child, QgsLayerTreeLayer):
+            lyr = child.layer()
+            if lyr is not None and lyr.name() == layer_name:
+                to_remove.append(lyr.id())
+    if to_remove:
+        project.removeMapLayers(to_remove)
+
+
+def _remove_child_group(parent: QgsLayerTreeGroup, group_name: str) -> None:
+    """Clear and remove a named child group if it exists."""
+    for child in list(parent.children()):
+        if isinstance(child, QgsLayerTreeGroup) and child.name() == group_name:
+            clear_group_layers(child)
+            parent.removeChildNode(child)
+            return
+
+
 def organize_layer_tree(
     polygon_name: str,
-    area_kml_paths: Optional[List[str]] = None,
+    area_kml_path: Optional[str] = None,
     linear_kml_paths: Optional[List[str]] = None,
     hazard_gpx_paths: Optional[List[Tuple[str, str]]] = None,
     replace_area: bool = False,
@@ -777,36 +884,36 @@ def organize_layer_tree(
 ) -> None:
     """Load exported files into Flight Plan groups.
 
-    Only replaces the subgroup(s) for the mode that was just generated, so a
-    failed Linear Search run never wipes an existing Area Search grid.
-
-    ``hazard_gpx_paths`` is a list of ``(path, style)`` where style is
-    ``"hazard_point"`` or ``"hazard_line"``.
+    Area Search is a single KML layer directly under ``Flight Plan_<polygon>``.
+    Linear Search remains a subgroup with one layer per feature (for now).
     """
     safe = sanitize_name(polygon_name)
     root = QgsProject.instance().layerTreeRoot()
     flight_group = get_or_create_group(root, f"Flight Plan_{safe}")
-    area_group = get_or_create_group(flight_group, f"Area Search_{safe}")
     linear_group = get_or_create_group(flight_group, f"Linear Search_{safe}")
     hazards_group = get_or_create_group(flight_group, "Potential Hazards")
 
-    area_paths = area_kml_paths or []
+    area_name = f"Area Search_{safe}"
     linear_paths = linear_kml_paths or []
     hazard_items = hazard_gpx_paths or []
-    grand_total = max(len(area_paths) + len(linear_paths) + len(hazard_items), 1)
+    area_count = 1 if area_kml_path else 0
+    grand_total = max(area_count + len(linear_paths) + len(hazard_items), 1)
     done_base = 0
 
     if replace_area:
-        clear_group_layers(area_group)
-        if area_paths:
-            def area_cb(done, total, msg):
-                if progress_callback:
-                    progress_callback(done, grand_total, msg)
-
-            add_kml_files_to_group(
-                area_group, area_paths, style="area", progress_callback=area_cb
-            )
-        done_base = len(area_paths)
+        # Drop legacy per-cell Area Search subgroup from older plugin versions
+        _remove_child_group(flight_group, area_name)
+        _remove_direct_layers_named(flight_group, area_name)
+        if area_kml_path:
+            layer = load_kml_layer(area_kml_path)
+            if layer is not None:
+                layer.setName(area_name)
+                QgsProject.instance().addMapLayer(layer, False)
+                style_area_grid_layer(layer)
+                flight_group.addLayer(layer)
+            if progress_callback:
+                progress_callback(1, grand_total, "Area Search layer loaded.")
+            done_base = 1
 
     if replace_linear:
         clear_group_layers(linear_group)

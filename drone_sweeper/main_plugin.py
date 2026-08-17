@@ -16,8 +16,10 @@ from qgis.PyQt.QtWidgets import QAction, QMessageBox, QProgressDialog
 from .drone_sweeper_dialog import MODE_AREA, MODE_LINEAR, DroneSweeperDialog
 from .processing_engine import (
     ProcessingError,
+    area_search_kml_path,
     build_output_folders,
     ensure_project_directory,
+    export_area_search_kml,
     export_features_as_individual_kml,
     export_hazards_as_gpx,
     generate_grid_layer,
@@ -181,17 +183,18 @@ class DroneSweeperPlugin:
         set_progress(2, "Checking project save location…")
         project_dir = ensure_project_directory()
 
-        set_progress(5, "Creating Area Search folders…")
-        flight_dir, area_dir, _linear_dir, hazards_dir = build_output_folders(
+        set_progress(5, "Creating Flight Plan folder…")
+        flight_dir, _area_parent, _linear_dir, hazards_dir = build_output_folders(
             project_dir,
             polygon_name,
             create_area=True,
             create_linear=False,
             create_hazards=True,
         )
+        area_kml = area_search_kml_path(flight_dir, polygon_name)
 
         def grid_cb(done, total, msg):
-            set_progress(5 + int(35 * (done / max(total, 1))), msg)
+            set_progress(5 + int(40 * (done / max(total, 1))), msg)
 
         set_progress(8, "Generating MGRS-aligned search grid…")
         grid_layer = generate_grid_layer(
@@ -199,36 +202,30 @@ class DroneSweeperPlugin:
         )
 
         def kml_cb(done, total, msg):
-            set_progress(42 + int(22 * (done / max(total, 1))), msg)
+            set_progress(50 + int(25 * (done / max(total, 1))), msg)
 
-        set_progress(42, "Exporting grid cell KML files…")
-        area_files = export_features_as_individual_kml(
-            grid_layer, "name", area_dir, progress_callback=kml_cb
-        )
+        set_progress(50, "Exporting Area Search KML…")
+        export_area_search_kml(grid_layer, area_kml, progress_callback=kml_cb)
+        n_cells = grid_layer.featureCount()
 
-        def tree_cb(done, total, msg):
-            set_progress(66 + int(12 * (done / max(total, 1))), msg)
-
-        set_progress(66, "Loading grid KMLs into the layer panel…")
+        set_progress(78, "Loading Area Search layer…")
         organize_layer_tree(
             polygon_name,
-            area_kml_paths=area_files,
+            area_kml_path=area_kml,
             replace_area=True,
             replace_linear=False,
             replace_hazards=False,
-            progress_callback=tree_cb,
         )
 
         # Best-effort hazards: never fail the Area Search grid if OSM is down
         hazard_note = ""
-        hazard_files: list = []
-        set_progress(80, "Fetching potential hazards (power lines / pylons)…")
+        set_progress(82, "Fetching potential hazards (power lines / pylons)…")
         try:
             def haz_msg(msg: str):
-                set_progress(82, msg)
+                set_progress(84, msg)
 
             points, lines = fetch_and_clip_hazards(layer, progress_callback=haz_msg)
-            set_progress(90, "Exporting hazard GPX files…")
+            set_progress(92, "Exporting hazard GPX files…")
             hazard_files = export_hazards_as_gpx(points, lines, hazards_dir)
             organize_layer_tree(
                 polygon_name,
@@ -261,9 +258,9 @@ class DroneSweeperPlugin:
 
         set_progress(100, "Done.")
         return (
-            f"Area Search: exported {len(area_files)} grid KML file(s) for “{polygon_name}”.\n\n"
+            f"Area Search: {n_cells} grid cell(s) in one KML for “{polygon_name}”.\n\n"
             f"Flight Plan: {flight_dir}\n"
-            f"Area Search: {area_dir}"
+            f"KML: {area_kml}"
             f"{hazard_note}"
         )
 

@@ -88,10 +88,9 @@ class DroneSweeperDialog(QDialog):
         )
         area_form.addRow("Grid size:", self.grid_size)
         area_note = QLabel(
-            "Grid edges snap to MGRS easting/northing lines. "
-            "Cells are named polygon_XY_MGRS (100 m / 6-digit MGRS). "
-            "Also tries to download Potential Hazards (power lines / pylons) as GPX "
-            "when online — grid generation still succeeds offline."
+            "Grid edges snap to MGRS easting/northing lines (multiples of 10 m). "
+            "One KML + one layer: Area Search_<polygon>, with features named A1_<polygon>, … "
+            "Potential Hazards (power lines/pylons) are fetched when online."
         )
         area_note.setWordWrap(True)
         area_note.setStyleSheet("color: #555; font-size: 11px;")
@@ -127,8 +126,8 @@ class DroneSweeperDialog(QDialog):
 
         tip = QLabel(
             "Output next to the project file:\n"
-            "Flight Plan_<polygon>/Area Search_<polygon>/  and  Linear Search_<polygon>/\n"
-            "KML is written in DJI Pilot 2–compatible format."
+            "Flight Plan_<polygon>/Area Search_<polygon>.kml\n"
+            "Flight Plan_<polygon>/Linear Search_<polygon>/  (per-feature KMLs for now)"
         )
         tip.setWordWrap(True)
         tip.setStyleSheet("color: #666; font-size: 11px;")
