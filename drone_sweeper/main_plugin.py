@@ -20,12 +20,15 @@ from .processing_engine import (
     build_output_folders,
     ensure_project_directory,
     export_area_search_kml,
-    export_features_as_individual_kml,
     export_hazards_as_gpx,
+    export_linear_category_kml,
+    filter_lines_by_category,
     generate_grid_layer,
     name_linear_features,
     organize_layer_tree,
+    paths_trails_kml_path,
     sanitize_name,
+    waterways_streams_kml_path,
 )
 from .osm_fetcher import OsmFetchError, fetch_and_clip_hazards, fetch_and_clip_osm
 
@@ -275,10 +278,12 @@ class DroneSweeperPlugin:
         set_progress(2, "Checking project save location…")
         project_dir = ensure_project_directory()
 
-        set_progress(5, "Creating Linear Search folder…")
-        flight_dir, _area_dir, linear_dir, _hazards_dir = build_output_folders(
+        set_progress(5, "Creating Flight Plan folder…")
+        flight_dir, _a, _l, _h = build_output_folders(
             project_dir, polygon_name, create_area=False, create_linear=True
         )
+        trails_path = paths_trails_kml_path(flight_dir, polygon_name)
+        water_path = waterways_streams_kml_path(flight_dir, polygon_name)
 
         set_progress(10, "Fetching OpenStreetMap features…")
 
@@ -291,40 +296,54 @@ class DroneSweeperPlugin:
             fetch_waterways=fetch_waterways,
             progress_callback=osm_msg,
         )
-        set_progress(55, "Naming linear features (MGRS)…")
+        set_progress(55, "Naming linear features…")
         linear_layer = name_linear_features(clipped, polygon_name)
 
-        linear_files: list = []
-        if linear_layer.featureCount() > 0:
-            def kml_cb(done, total, msg):
-                set_progress(60 + int(20 * (done / max(total, 1))), msg)
+        trails_kml = None
+        water_kml = None
+        n_trails = n_water = 0
 
-            set_progress(60, "Exporting linear feature KML files…")
-            linear_files = export_features_as_individual_kml(
-                linear_layer,
-                "export_name",
-                linear_dir,
-                progress_callback=kml_cb,
+        if fetch_trails:
+            trails = filter_lines_by_category(
+                linear_layer, "trail", f"Paths and Trails_{sanitize_name(polygon_name)}"
             )
-        else:
+            n_trails = trails.featureCount()
+            set_progress(60, f"Exporting Paths and Trails ({n_trails} features)…")
+            trails_kml = export_linear_category_kml(trails, trails_path)
+
+        if fetch_waterways:
+            water = filter_lines_by_category(
+                linear_layer,
+                "waterway",
+                f"Waterways and Streams_{sanitize_name(polygon_name)}",
+            )
+            n_water = water.featureCount()
+            set_progress(72, f"Exporting Waterways and Streams ({n_water} features)…")
+            water_kml = export_linear_category_kml(water, water_path)
+
+        if n_trails == 0 and n_water == 0:
             set_progress(80, "No OSM linear features found inside the AOI.")
 
-        def tree_cb(done, total, msg):
-            set_progress(82 + int(16 * (done / max(total, 1))), msg)
-
-        set_progress(82, "Loading linear KMLs into the layer panel…")
+        set_progress(85, "Loading linear layers…")
         organize_layer_tree(
             polygon_name,
-            linear_kml_paths=linear_files,
+            trails_kml_path=trails_kml,
+            waterways_kml_path=water_kml,
             replace_area=False,
             replace_linear=True,
             replace_hazards=False,
-            progress_callback=tree_cb,
         )
 
         set_progress(100, "Done.")
-        return (
-            f"Linear Search: exported {len(linear_files)} KML file(s) for “{polygon_name}”.\n\n"
-            f"Flight Plan: {flight_dir}\n"
-            f"Linear Search: {linear_dir}"
-        )
+        lines = [
+            f"Linear Search for “{polygon_name}”:",
+            f"  Paths and Trails: {n_trails} feature(s)",
+            f"  Waterways and Streams: {n_water} feature(s)",
+            "",
+            f"Flight Plan: {flight_dir}",
+        ]
+        if trails_kml:
+            lines.append(f"KML: {trails_kml}")
+        if water_kml:
+            lines.append(f"KML: {water_kml}")
+        return "\n".join(lines)

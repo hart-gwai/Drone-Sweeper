@@ -28,6 +28,11 @@ from qgis.PyQt.QtCore import QUrl, QVariant
 from qgis.PyQt.QtNetwork import QNetworkRequest
 
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+OVERPASS_ENDPOINTS = (
+    "https://overpass-api.de/api/interpreter",
+    "https://lz4.overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+)
 
 TRAIL_HIGHWAYS = ("path", "footway", "track", "steps", "bridleway", "cycleway")
 WATERWAY_TYPES = ("stream", "river", "canal", "drain")
@@ -149,7 +154,11 @@ def build_overpass_query(
     fetch_trails: bool = True,
     fetch_waterways: bool = True,
 ) -> str:
-    """Build an Overpass QL query for trails and/or waterways in a bbox."""
+    """Build an Overpass QL query for trails and/or waterways in a bbox.
+
+    Uses ``out geom`` so way coordinates come inline (faster/more reliable than
+    ``out body`` + separate node resolution).
+    """
     if not fetch_trails and not fetch_waterways:
         raise OsmFetchError("At least one OSM feature type must be enabled.")
 
@@ -164,13 +173,11 @@ def build_overpass_query(
 
     body = "\n  ".join(parts)
     return f"""
-[out:json][timeout:90];
+[out:json][timeout:180];
 (
   {body}
 );
-out body;
->;
-out skel qt;
+out geom;
 """.strip()
 
 
@@ -185,7 +192,7 @@ def build_hazards_overpass_query(
     line_re = "|".join(POWER_LINE_TYPES)
     point_re = "|".join(POWER_POINT_TYPES)
     return f"""
-[out:json][timeout:90];
+[out:json][timeout:180];
 (
   way["power"~"{line_re}"]({bbox});
   node["power"~"{point_re}"]({bbox});
@@ -196,13 +203,13 @@ out skel qt;
 """.strip()
 
 
-def _post_overpass(query: str, timeout_ms: int = 120000) -> dict:
-    """POST an Overpass query using QgsNetworkAccessManager (blocking)."""
+def _post_overpass(query: str, endpoint: str, timeout_ms: int = 200000) -> dict:
+    """POST an Overpass query to one endpoint using QgsNetworkAccessManager."""
     from qgis.PyQt.QtCore import QEventLoop, QTimer
     from qgis.PyQt.QtNetwork import QNetworkReply
 
     nam = QgsNetworkAccessManager.instance()
-    request = QNetworkRequest(QUrl(OVERPASS_URL))
+    request = QNetworkRequest(QUrl(endpoint))
     request.setHeader(
         QNetworkRequest.ContentTypeHeader,
         "application/x-www-form-urlencoded",
@@ -222,57 +229,93 @@ def _post_overpass(query: str, timeout_ms: int = 120000) -> dict:
     if not reply.isFinished():
         reply.abort()
         reply.deleteLater()
-        raise OsmFetchError("Overpass API request timed out.")
+        raise OsmFetchError(f"Overpass timed out ({endpoint}).")
 
     err = reply.error()
+    err_str = reply.errorString()
     raw = bytes(reply.readAll())
+    status = reply.attribute(QNetworkRequest.HttpStatusCodeAttribute)
     reply.deleteLater()
 
     if err != QNetworkReply.NoError:
-        raise OsmFetchError(f"Overpass network error: {reply.errorString()}")
+        raise OsmFetchError(f"Overpass network error ({endpoint}): {err_str}")
+
+    if status in (429, 504, 502, 503):
+        raise OsmFetchError(f"Overpass server busy/error HTTP {status} ({endpoint}).")
 
     try:
-        return json.loads(raw.decode("utf-8"))
+        data = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise OsmFetchError(f"Invalid Overpass JSON response: {exc}") from exc
+        raise OsmFetchError(f"Invalid Overpass JSON from {endpoint}: {exc}") from exc
+
+    # Overpass sometimes returns a remark about timeout with partial/empty data
+    remark = str(data.get("remark") or "")
+    if "timeout" in remark.lower() or "error" in remark.lower():
+        raise OsmFetchError(f"Overpass remark from {endpoint}: {remark}")
+    return data
 
 
-def _fallback_urllib(query: str, timeout_s: int = 90) -> dict:
-    """Fallback HTTP POST via urllib if network manager is unavailable."""
+def _fallback_urllib(query: str, endpoint: str, timeout_s: int = 180) -> dict:
+    """HTTP POST via urllib to one Overpass endpoint."""
     import urllib.error
     import urllib.parse
     import urllib.request
 
     data = urllib.parse.urlencode({"data": query}).encode("utf-8")
     req = urllib.request.Request(
-        OVERPASS_URL,
+        endpoint,
         data=data,
         headers={"Content-Type": "application/x-www-form-urlencoded"},
         method="POST",
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+            payload = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raise OsmFetchError(f"Overpass HTTP {exc.code} ({endpoint})") from exc
     except urllib.error.URLError as exc:
-        raise OsmFetchError(f"Overpass request failed: {exc}") from exc
+        raise OsmFetchError(f"Overpass request failed ({endpoint}): {exc}") from exc
     except json.JSONDecodeError as exc:
-        raise OsmFetchError(f"Invalid Overpass JSON response: {exc}") from exc
+        raise OsmFetchError(f"Invalid Overpass JSON from {endpoint}: {exc}") from exc
+
+    remark = str(payload.get("remark") or "")
+    if "timeout" in remark.lower() or "error" in remark.lower():
+        raise OsmFetchError(f"Overpass remark from {endpoint}: {remark}")
+    return payload
 
 
 def fetch_overpass_json(
     query: str,
     progress_callback: Optional[Callable[[str], None]] = None,
 ) -> dict:
-    """Execute Overpass query; prefer QgsNetworkAccessManager, else urllib."""
-    if progress_callback:
-        progress_callback("Querying OpenStreetMap Overpass API…")
-    try:
-        return _post_overpass(query)
-    except OsmFetchError as primary:
-        try:
-            return _fallback_urllib(query)
-        except OsmFetchError:
-            raise primary
+    """Execute Overpass query with mirror failover and retries."""
+    import time
+
+    errors: List[str] = []
+    endpoints = list(OVERPASS_ENDPOINTS)
+    # Up to 2 full passes across mirrors
+    for attempt in range(2):
+        for endpoint in endpoints:
+            host = endpoint.split("//", 1)[-1].split("/", 1)[0]
+            if progress_callback:
+                suffix = f" (retry {attempt + 1})" if attempt else ""
+                progress_callback(f"Querying OpenStreetMap ({host}){suffix}…")
+            try:
+                return _post_overpass(query, endpoint=endpoint)
+            except OsmFetchError as exc:
+                errors.append(str(exc))
+                try:
+                    return _fallback_urllib(query, endpoint=endpoint)
+                except OsmFetchError as exc2:
+                    errors.append(str(exc2))
+            # Brief pause before next mirror / retry
+            time.sleep(1.5 + attempt * 2.0)
+
+    detail = " | ".join(errors[-6:]) if errors else "unknown error"
+    raise OsmFetchError(
+        "OpenStreetMap Overpass request failed after retries on multiple servers. "
+        f"Last errors: {detail}"
+    )
 
 
 def _nodes_index(elements: Sequence[dict]) -> Dict[int, Tuple[float, float]]:
@@ -288,13 +331,24 @@ def _way_to_geometry(
     way: dict,
     nodes: Dict[int, Tuple[float, float]],
 ) -> Optional[QgsGeometry]:
-    """Build a LineString geometry from an OSM way in EPSG:4326."""
+    """Build a LineString from an OSM way (supports ``out geom`` and node refs)."""
     coords: List[QgsPointXY] = []
-    for nid in way.get("nodes", []):
-        if nid not in nodes:
-            continue
-        lon, lat = nodes[nid]
-        coords.append(QgsPointXY(lon, lat))
+
+    # Prefer inline geometry from ``out geom``
+    geometry = way.get("geometry")
+    if geometry:
+        for pt in geometry:
+            try:
+                coords.append(QgsPointXY(float(pt["lon"]), float(pt["lat"])))
+            except (KeyError, TypeError, ValueError):
+                continue
+    else:
+        for nid in way.get("nodes", []):
+            if nid not in nodes:
+                continue
+            lon, lat = nodes[nid]
+            coords.append(QgsPointXY(lon, lat))
+
     if len(coords) < 2:
         return None
     return QgsGeometry.fromPolylineXY(coords)
@@ -492,21 +546,69 @@ def line_midpoint_xy(geom: QgsGeometry) -> Optional[QgsPointXY]:
         return None
 
 
+def _merge_line_layers(
+    layers: List[QgsVectorLayer],
+    name: str = "OSM Linear Features",
+) -> QgsVectorLayer:
+    """Combine multiple LineString memory layers into one."""
+    out = QgsVectorLayer("LineString?crs=EPSG:4326", name, "memory")
+    if not layers:
+        return out
+    provider = out.dataProvider()
+    provider.addAttributes(layers[0].fields())
+    out.updateFields()
+    feats: List[QgsFeature] = []
+    for lyr in layers:
+        for feat in lyr.getFeatures():
+            nf = QgsFeature(out.fields())
+            nf.setGeometry(QgsGeometry(feat.geometry()))
+            # Map by field name in case field order differs
+            for field in out.fields():
+                idx = feat.fields().indexOf(field.name())
+                if idx >= 0:
+                    nf.setAttribute(field.name(), feat.attribute(idx))
+            feats.append(nf)
+    if feats:
+        provider.addFeatures(feats)
+    out.updateExtents()
+    return out
+
+
 def fetch_and_clip_osm(
     aoi_layer: QgsVectorLayer,
     fetch_trails: bool,
     fetch_waterways: bool,
     progress_callback: Optional[Callable[[str], None]] = None,
 ) -> QgsVectorLayer:
-    """Full pipeline: bbox → Overpass → memory layer → clip to AOI."""
+    """Full pipeline: bbox → Overpass → memory layer → clip to AOI.
+
+    Trails and waterways are requested as separate Overpass queries to reduce
+    timeout risk on large AOIs.
+    """
     south, west, north, east = polygon_layer_bbox_wgs84(aoi_layer)
-    query = build_overpass_query(
-        south, west, north, east, fetch_trails, fetch_waterways
-    )
-    data = fetch_overpass_json(query, progress_callback=progress_callback)
+    parts: List[QgsVectorLayer] = []
+
+    if fetch_trails:
+        if progress_callback:
+            progress_callback("Fetching OSM paths & trails…")
+        query = build_overpass_query(
+            south, west, north, east, fetch_trails=True, fetch_waterways=False
+        )
+        data = fetch_overpass_json(query, progress_callback=progress_callback)
+        parts.append(osm_json_to_memory_layer(data, "OSM Trails"))
+
+    if fetch_waterways:
+        if progress_callback:
+            progress_callback("Fetching OSM waterways & streams…")
+        query = build_overpass_query(
+            south, west, north, east, fetch_trails=False, fetch_waterways=True
+        )
+        data = fetch_overpass_json(query, progress_callback=progress_callback)
+        parts.append(osm_json_to_memory_layer(data, "OSM Waterways"))
+
     if progress_callback:
         progress_callback("Building OSM vector layer…")
-    raw_layer = osm_json_to_memory_layer(data, "OSM Linear Features")
+    raw_layer = _merge_line_layers(parts, "OSM Linear Features")
     aoi_geom = union_aoi_geometry(aoi_layer)
     if progress_callback:
         progress_callback("Clipping OSM features to AOI…")

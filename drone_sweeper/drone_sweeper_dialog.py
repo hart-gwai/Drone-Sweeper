@@ -125,9 +125,9 @@ class DroneSweeperDialog(QDialog):
         root.addWidget(self.stack)
 
         tip = QLabel(
-            "Output next to the project file:\n"
-            "Flight Plan_<polygon>/Area Search_<polygon>.kml\n"
-            "Flight Plan_<polygon>/Linear Search_<polygon>/  (per-feature KMLs for now)"
+            "Output next to the project file under Flight Plan_<polygon>/:\n"
+            "Area Search_<polygon>.kml\n"
+            "Paths and Trails_<polygon>.kml  ·  Waterways and Streams_<polygon>.kml"
         )
         tip.setWordWrap(True)
         tip.setStyleSheet("color: #666; font-size: 11px;")

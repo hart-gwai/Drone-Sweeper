@@ -34,11 +34,10 @@ from qgis.core import (
 from qgis.PyQt.QtCore import QVariant, QDir
 from qgis.PyQt.QtGui import QColor
 
-from .mgrs_converter import format_feature_name, latlon_to_mgrs
+from .mgrs_converter import latlon_to_mgrs
 from .osm_fetcher import (
     OsmFetchError,
     layer_feature_extent,
-    line_midpoint_xy,
     transform_geometry,
     union_aoi_geometry,
 )
@@ -167,30 +166,35 @@ def build_output_folders(
     create_linear: bool = True,
     create_hazards: bool = False,
 ) -> Tuple[str, str, str, str]:
-    """Create and return (flight, area_parent, linear_dir, hazards_dir).
+    """Create and return (flight, area_parent, linear_parent, hazards_dir).
 
-    Area Search KML is written directly into the Flight Plan folder
-    (``Area Search_<polygon>.kml``). Linear Search still uses a subfolder.
+    Area and Linear KMLs are written directly into the Flight Plan folder.
     """
     safe = sanitize_filename(polygon_name)
     flight = os.path.join(project_dir, f"Flight Plan_{safe}")
-    area_parent = flight
-    linear_dir = os.path.join(flight, f"Linear Search_{safe}")
     hazards_dir = os.path.join(flight, "Potential Hazards")
     os.makedirs(flight, exist_ok=True)
-    if create_linear:
-        os.makedirs(linear_dir, exist_ok=True)
     if create_hazards:
         os.makedirs(hazards_dir, exist_ok=True)
-    # create_area only needs the flight folder (already created)
     _ = create_area
-    return flight, area_parent, linear_dir, hazards_dir
+    _ = create_linear
+    return flight, flight, flight, hazards_dir
 
 
 def area_search_kml_path(flight_dir: str, polygon_name: str) -> str:
     """``…/Flight Plan_<poly>/Area Search_<poly>.kml``."""
     safe = sanitize_filename(polygon_name)
     return os.path.join(flight_dir, f"Area Search_{safe}.kml")
+
+
+def paths_trails_kml_path(flight_dir: str, polygon_name: str) -> str:
+    safe = sanitize_filename(polygon_name)
+    return os.path.join(flight_dir, f"Paths and Trails_{safe}.kml")
+
+
+def waterways_streams_kml_path(flight_dir: str, polygon_name: str) -> str:
+    safe = sanitize_filename(polygon_name)
+    return os.path.join(flight_dir, f"Waterways and Streams_{safe}.kml")
 
 
 def generate_grid_layer(
@@ -324,10 +328,17 @@ def name_linear_features(
     line_layer: QgsVectorLayer,
     polygon_name: str,
 ) -> QgsVectorLayer:
-    """Return a copy of line_layer with a resolved display ``export_name`` field."""
+    """Return a copy of line_layer with a resolved display ``export_name`` field.
+
+    - OSM ``name`` tag when present (unchanged)
+    - Otherwise sequential short names:
+      ``Trail1_<polygon>``, ``Trail2_<polygon>``, …
+      ``water1_<polygon>``, ``water2_<polygon>``, …
+    """
+    safe_poly = sanitize_name(polygon_name)
     out = QgsVectorLayer(
         f"LineString?crs={line_layer.crs().authid()}",
-        f"Linear Search_{sanitize_name(polygon_name)}",
+        f"Linear_{safe_poly}",
         "memory",
     )
     provider = out.dataProvider()
@@ -338,16 +349,10 @@ def name_linear_features(
     provider.addAttributes(fields)
     out.updateFields()
 
-    wgs84 = QgsCoordinateReferenceSystem("EPSG:4326")
-    src_crs = line_layer.crs()
-    xform = (
-        None
-        if src_crs == wgs84
-        else QgsCoordinateTransform(src_crs, wgs84, QgsProject.instance())
-    )
-
     features: List[QgsFeature] = []
     used_names: dict = {}
+    trail_i = 0
+    water_i = 0
 
     for feat in line_layer.getFeatures():
         geom = feat.geometry()
@@ -355,21 +360,18 @@ def name_linear_features(
             continue
 
         osm_name = (feat.attribute("name") or "").strip()
-        feature_type = (feat.attribute("feature_type") or "Path").strip() or "Path"
+        category = (feat.attribute("category") or "").strip()
 
         if osm_name:
             export_name = osm_name
+        elif category == "waterway":
+            water_i += 1
+            export_name = f"water{water_i}_{safe_poly}"
         else:
-            mid = line_midpoint_xy(geom)
-            if mid is None:
-                export_name = f"{feature_type} unnamed"
-            else:
-                pt = mid
-                if xform is not None:
-                    pt = xform.transform(mid)
-                export_name = format_feature_name(feature_type, pt.y(), pt.x(), precision=3)
+            trail_i += 1
+            export_name = f"Trail{trail_i}_{safe_poly}"
 
-        # Ensure uniqueness for file names
+        # Ensure uniqueness (mainly for duplicate OSM names)
         base = export_name
         if base in used_names:
             used_names[base] += 1
@@ -385,6 +387,34 @@ def name_linear_features(
 
     if features:
         provider.addFeatures(features)
+    out.updateExtents()
+    return out
+
+
+def filter_lines_by_category(
+    line_layer: QgsVectorLayer,
+    category: str,
+    layer_name: str,
+) -> QgsVectorLayer:
+    """Copy features whose ``category`` attribute matches (trail / waterway)."""
+    out = QgsVectorLayer(
+        f"LineString?crs={line_layer.crs().authid()}",
+        layer_name,
+        "memory",
+    )
+    provider = out.dataProvider()
+    provider.addAttributes(line_layer.fields())
+    out.updateFields()
+    feats = []
+    for feat in line_layer.getFeatures():
+        if (feat.attribute("category") or "") != category:
+            continue
+        nf = QgsFeature(out.fields())
+        nf.setGeometry(QgsGeometry(feat.geometry()))
+        nf.setAttributes(feat.attributes())
+        feats.append(nf)
+    if feats:
+        provider.addFeatures(feats)
     out.updateExtents()
     return out
 
@@ -581,6 +611,85 @@ def export_area_search_kml(
     write_dji_kml(out_path, kml_text)
     if progress_callback:
         progress_callback(total, total, f"Wrote {len(placemarks)} grid polygons to KML.")
+    return out_path
+
+
+def _linestring_kml_geometry_xml(geom_wgs84: QgsGeometry, altitude_m: float = 0.0) -> str:
+    if QgsWkbTypes.geometryType(geom_wgs84.wkbType()) != QgsWkbTypes.LineGeometry:
+        raise ProcessingError("Expected line geometry for linear KML.")
+    if QgsWkbTypes.isMultiType(geom_wgs84.wkbType()):
+        line = max(geom_wgs84.asMultiPolyline(), key=len)
+    else:
+        line = geom_wgs84.asPolyline()
+    coords = _line_to_coord_text(line, altitude_m=altitude_m)
+    if coords.count(",") < 4:
+        raise ProcessingError("Line has too few vertices for DJI KML.")
+    return f"""    <LineString>
+      <tessellate>1</tessellate>
+      <altitudeMode>relativeToGround</altitudeMode>
+      <coordinates>{coords}</coordinates>
+    </LineString>"""
+
+
+def export_linear_category_kml(
+    line_layer: QgsVectorLayer,
+    out_path: str,
+    name_field: str = "export_name",
+    altitude_m: float = 0.0,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
+) -> Optional[str]:
+    """Write one multi-placemark LineString KML. Returns path or None if empty."""
+    if line_layer.featureCount() == 0:
+        return None
+
+    doc_name = xml_escape(os.path.splitext(os.path.basename(out_path))[0])
+    features = list(line_layer.getFeatures())
+    total = len(features)
+    placemarks: List[str] = []
+
+    for i, feat in enumerate(features, start=1):
+        raw_name = str(feat.attribute(name_field) or f"feature_{i}")
+        geom = feat.geometry()
+        if geom is None or geom.isEmpty():
+            continue
+        if QgsWkbTypes.geometryType(geom.wkbType()) != QgsWkbTypes.LineGeometry:
+            continue
+        if QgsWkbTypes.isMultiType(geom.wkbType()):
+            lines = geom.asMultiPolyline()
+            if lines:
+                geom = QgsGeometry.fromPolylineXY(max(lines, key=len))
+        geom_wgs = _reproject_geom_wgs84(geom, line_layer.crs())
+        try:
+            geom_xml = _linestring_kml_geometry_xml(geom_wgs, altitude_m=altitude_m)
+        except ProcessingError:
+            continue
+        placemarks.append(
+            f"""  <Placemark>
+    <name>{xml_escape(raw_name)}</name>
+    <styleUrl>#lineStyle</styleUrl>
+{geom_xml}
+  </Placemark>"""
+        )
+        if progress_callback and (i % 20 == 0 or i == total):
+            progress_callback(i, total, f"Writing linear KML ({i}/{total})…")
+
+    if not placemarks:
+        return None
+
+    kml_text = f"""<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+<Document>
+  <name>{doc_name}</name>
+  <Style id="lineStyle">
+    <LineStyle><color>ff00a0ff</color><width>2</width></LineStyle>
+  </Style>
+{chr(10).join(placemarks)}
+</Document>
+</kml>
+"""
+    if os.path.exists(out_path):
+        os.remove(out_path)
+    write_dji_kml(out_path, kml_text)
     return out_path
 
 
@@ -805,6 +914,38 @@ def style_linear_layer(layer: QgsVectorLayer, color_index: int = 0) -> None:
     layer.triggerRepaint()
 
 
+def style_trails_layer(layer: QgsVectorLayer) -> None:
+    """Distinct trail symbology (green)."""
+    symbol = QgsLineSymbol.createSimple(
+        {
+            "line_color": "0,150,70,255",
+            "line_width": "2.0",
+            "line_width_unit": "MM",
+            "line_style": "solid",
+            "capstyle": "round",
+            "joinstyle": "round",
+        }
+    )
+    layer.setRenderer(QgsSingleSymbolRenderer(symbol))
+    layer.triggerRepaint()
+
+
+def style_waterways_layer(layer: QgsVectorLayer) -> None:
+    """Distinct waterway symbology (blue)."""
+    symbol = QgsLineSymbol.createSimple(
+        {
+            "line_color": "0,110,220,255",
+            "line_width": "2.0",
+            "line_width_unit": "MM",
+            "line_style": "solid",
+            "capstyle": "round",
+            "joinstyle": "round",
+        }
+    )
+    layer.setRenderer(QgsSingleSymbolRenderer(symbol))
+    layer.triggerRepaint()
+
+
 def add_kml_files_to_group(
     group: QgsLayerTreeGroup,
     kml_paths: List[str],
@@ -875,7 +1016,8 @@ def _remove_child_group(parent: QgsLayerTreeGroup, group_name: str) -> None:
 def organize_layer_tree(
     polygon_name: str,
     area_kml_path: Optional[str] = None,
-    linear_kml_paths: Optional[List[str]] = None,
+    trails_kml_path: Optional[str] = None,
+    waterways_kml_path: Optional[str] = None,
     hazard_gpx_paths: Optional[List[Tuple[str, str]]] = None,
     replace_area: bool = False,
     replace_linear: bool = False,
@@ -884,24 +1026,25 @@ def organize_layer_tree(
 ) -> None:
     """Load exported files into Flight Plan groups.
 
-    Area Search is a single KML layer directly under ``Flight Plan_<polygon>``.
-    Linear Search remains a subgroup with one layer per feature (for now).
+    Area / Paths / Waterways are single KML layers directly under
+    ``Flight Plan_<polygon>``.
     """
     safe = sanitize_name(polygon_name)
     root = QgsProject.instance().layerTreeRoot()
     flight_group = get_or_create_group(root, f"Flight Plan_{safe}")
-    linear_group = get_or_create_group(flight_group, f"Linear Search_{safe}")
     hazards_group = get_or_create_group(flight_group, "Potential Hazards")
 
     area_name = f"Area Search_{safe}"
-    linear_paths = linear_kml_paths or []
+    trails_name = f"Paths and Trails_{safe}"
+    water_name = f"Waterways and Streams_{safe}"
     hazard_items = hazard_gpx_paths or []
+
+    linear_count = (1 if trails_kml_path else 0) + (1 if waterways_kml_path else 0)
     area_count = 1 if area_kml_path else 0
-    grand_total = max(area_count + len(linear_paths) + len(hazard_items), 1)
-    done_base = 0
+    grand_total = max(area_count + linear_count + len(hazard_items), 1)
+    done = 0
 
     if replace_area:
-        # Drop legacy per-cell Area Search subgroup from older plugin versions
         _remove_child_group(flight_group, area_name)
         _remove_direct_layers_named(flight_group, area_name)
         if area_kml_path:
@@ -911,21 +1054,37 @@ def organize_layer_tree(
                 QgsProject.instance().addMapLayer(layer, False)
                 style_area_grid_layer(layer)
                 flight_group.addLayer(layer)
+            done += 1
             if progress_callback:
-                progress_callback(1, grand_total, "Area Search layer loaded.")
-            done_base = 1
+                progress_callback(done, grand_total, "Area Search layer loaded.")
 
     if replace_linear:
-        clear_group_layers(linear_group)
-        if linear_paths:
-            def linear_cb(done, total, msg):
-                if progress_callback:
-                    progress_callback(done_base + done, grand_total, msg)
+        # Drop legacy Linear Search subgroup + old per-feature layers
+        _remove_child_group(flight_group, f"Linear Search_{safe}")
+        _remove_direct_layers_named(flight_group, trails_name)
+        _remove_direct_layers_named(flight_group, water_name)
 
-            add_kml_files_to_group(
-                linear_group, linear_paths, style="linear", progress_callback=linear_cb
-            )
-        done_base += len(linear_paths)
+        if trails_kml_path:
+            layer = load_kml_layer(trails_kml_path)
+            if layer is not None:
+                layer.setName(trails_name)
+                QgsProject.instance().addMapLayer(layer, False)
+                style_trails_layer(layer)
+                flight_group.addLayer(layer)
+            done += 1
+            if progress_callback:
+                progress_callback(done, grand_total, "Paths and Trails layer loaded.")
+
+        if waterways_kml_path:
+            layer = load_kml_layer(waterways_kml_path)
+            if layer is not None:
+                layer.setName(water_name)
+                QgsProject.instance().addMapLayer(layer, False)
+                style_waterways_layer(layer)
+                flight_group.addLayer(layer)
+            done += 1
+            if progress_callback:
+                progress_callback(done, grand_total, "Waterways and Streams layer loaded.")
 
     if replace_hazards:
         clear_group_layers(hazards_group)
