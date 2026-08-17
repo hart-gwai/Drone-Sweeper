@@ -8,7 +8,8 @@ from __future__ import annotations
 import math
 import os
 import re
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, List, Optional, Sequence, Tuple
+from xml.sax.saxutils import escape as xml_escape
 
 from qgis.core import (
     QgsCoordinateReferenceSystem,
@@ -370,61 +371,132 @@ def name_linear_features(
     return out
 
 
-def _writer_options() -> "QgsVectorFileWriter.SaveVectorOptions":
-    opts = QgsVectorFileWriter.SaveVectorOptions()
-    opts.driverName = "KML"
-    opts.fileEncoding = "UTF-8"
-    return opts
-
-
-def _write_kml_layer(tmp: QgsVectorLayer, out_path: str, src_crs: QgsCoordinateReferenceSystem) -> None:
-    """Write a single-feature layer to KML in WGS84 (QGIS 3.16+ compatible)."""
+def _reproject_geom_wgs84(
+    geom: QgsGeometry,
+    src_crs: QgsCoordinateReferenceSystem,
+) -> QgsGeometry:
+    """Return geometry copied into WGS84."""
+    out = QgsGeometry(geom)
     wgs84 = QgsCoordinateReferenceSystem("EPSG:4326")
-    transform_context = QgsProject.instance().transformContext()
+    if src_crs != wgs84:
+        xform = QgsCoordinateTransform(src_crs, wgs84, QgsProject.instance())
+        out.transform(xform)
+    return out
 
-    if hasattr(QgsVectorFileWriter, "writeAsVectorFormatV3"):
-        opts = _writer_options()
-        opts.ct = QgsCoordinateTransform(src_crs, wgs84, QgsProject.instance())
-        name_idx = tmp.fields().indexOf("Name")
-        if name_idx >= 0:
-            opts.attributes = [name_idx]
-        result = QgsVectorFileWriter.writeAsVectorFormatV3(
-            tmp, out_path, transform_context, opts
+
+def _ring_to_coord_text(
+    ring: Sequence,
+    altitude_m: float = 0.0,
+) -> str:
+    """Build ``lon,lat,alt lon,lat,alt …`` for DJI Pilot 2 (altitude required)."""
+    parts = []
+    for pt in ring:
+        # QgsPointXY or (x,y)
+        try:
+            lon, lat = float(pt.x()), float(pt.y())
+        except AttributeError:
+            lon, lat = float(pt[0]), float(pt[1])
+        if not (math.isfinite(lon) and math.isfinite(lat)):
+            continue
+        parts.append(f"{lon:.10f},{lat:.10f},{altitude_m:.1f}")
+    if len(parts) >= 2 and parts[0] != parts[-1]:
+        parts.append(parts[0])  # close ring
+    return " ".join(parts)
+
+
+def _line_to_coord_text(
+    line: Sequence,
+    altitude_m: float = 0.0,
+) -> str:
+    parts = []
+    for pt in line:
+        try:
+            lon, lat = float(pt.x()), float(pt.y())
+        except AttributeError:
+            lon, lat = float(pt[0]), float(pt[1])
+        if not (math.isfinite(lon) and math.isfinite(lat)):
+            continue
+        parts.append(f"{lon:.10f},{lat:.10f},{altitude_m:.1f}")
+    return " ".join(parts)
+
+
+def build_dji_pilot_kml(
+    name: str,
+    geom_wgs84: QgsGeometry,
+    altitude_m: float = 0.0,
+) -> str:
+    """Minimal KML accepted by DJI Pilot 2 (no Folder; altitude on every vertex).
+
+    Area/mapping import → Polygon. Waypoint / mapping corridor → LineString.
+    """
+    safe_name = xml_escape(name or "FlightPlan")
+    gtype = QgsWkbTypes.geometryType(geom_wgs84.wkbType())
+
+    if gtype == QgsWkbTypes.PolygonGeometry:
+        if QgsWkbTypes.isMultiType(geom_wgs84.wkbType()):
+            polys = geom_wgs84.asMultiPolygon()
+            ring = max(polys, key=lambda p: abs(QgsGeometry.fromPolygonXY(p).area()))[0]
+        else:
+            ring = geom_wgs84.asPolygon()[0]
+        coords = _ring_to_coord_text(ring, altitude_m=altitude_m)
+        if coords.count(",") < 6:  # need ≥3 vertices with lon,lat,alt
+            raise ProcessingError(f"Polygon “{name}” has too few vertices for DJI KML.")
+        geometry_xml = f"""    <Polygon>
+      <tessellate>1</tessellate>
+      <altitudeMode>relativeToGround</altitudeMode>
+      <outerBoundaryIs>
+        <LinearRing>
+          <coordinates>{coords}</coordinates>
+        </LinearRing>
+      </outerBoundaryIs>
+    </Polygon>"""
+        style = """  <Style id="polyStyle">
+    <LineStyle><color>ff0000ff</color><width>1.5</width></LineStyle>
+    <PolyStyle><color>7d0000ff</color></PolyStyle>
+  </Style>"""
+        style_url = "#polyStyle"
+    elif gtype == QgsWkbTypes.LineGeometry:
+        if QgsWkbTypes.isMultiType(geom_wgs84.wkbType()):
+            line = max(geom_wgs84.asMultiPolyline(), key=len)
+        else:
+            line = geom_wgs84.asPolyline()
+        coords = _line_to_coord_text(line, altitude_m=altitude_m)
+        if coords.count(",") < 4:  # need ≥2 vertices
+            raise ProcessingError(f"Line “{name}” has too few vertices for DJI KML.")
+        geometry_xml = f"""    <LineString>
+      <tessellate>1</tessellate>
+      <altitudeMode>relativeToGround</altitudeMode>
+      <coordinates>{coords}</coordinates>
+    </LineString>"""
+        style = """  <Style id="lineStyle">
+    <LineStyle><color>ff0000ff</color><width>2</width></LineStyle>
+  </Style>"""
+        style_url = "#lineStyle"
+    else:
+        raise ProcessingError(
+            f"Unsupported geometry for DJI KML (“{name}”). Need Polygon or LineString."
         )
-        err_code = result[0] if isinstance(result, tuple) else result
-        if err_code != QgsVectorFileWriter.NoError:
-            msg = result[2] if isinstance(result, tuple) and len(result) > 2 else str(result)
-            raise ProcessingError(f"Failed to write KML '{out_path}': {msg}")
-        return
 
-    # Fallback for older QGIS builds
-    ct = QgsCoordinateTransform(src_crs, wgs84, QgsProject.instance())
-    # Reproject feature geometries into a WGS84 temp layer when V3 API is missing
-    wgs_layer = QgsVectorLayer(
-        f"{QgsWkbTypes.displayString(QgsWkbTypes.flatType(next(tmp.getFeatures()).geometry().wkbType()))}"
-        f"?crs=EPSG:4326",
-        tmp.name(),
-        "memory",
-    )
-    wgs_prov = wgs_layer.dataProvider()
-    wgs_prov.addAttributes(tmp.fields())
-    wgs_layer.updateFields()
-    out_feats = []
-    for f in tmp.getFeatures():
-        g = QgsGeometry(f.geometry())
-        g.transform(ct)
-        nf = QgsFeature(wgs_layer.fields())
-        nf.setGeometry(g)
-        nf.setAttributes(f.attributes())
-        out_feats.append(nf)
-    wgs_prov.addFeatures(out_feats)
-    err = QgsVectorFileWriter.writeAsVectorFormat(
-        wgs_layer, out_path, "UTF-8", wgs84, "KML"
-    )
-    if isinstance(err, tuple):
-        err = err[0]
-    if err != QgsVectorFileWriter.NoError:
-        raise ProcessingError(f"Failed to write KML '{out_path}'.")
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+<Document>
+  <name>{safe_name}</name>
+{style}
+  <Placemark>
+    <name>{safe_name}</name>
+    <styleUrl>{style_url}</styleUrl>
+{geometry_xml}
+  </Placemark>
+</Document>
+</kml>
+"""
+
+
+def write_dji_kml(kml_path: str, kml_text: str) -> str:
+    """Write a DJI Pilot 2–compatible ``.kml`` file."""
+    with open(kml_path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(kml_text)
+    return kml_path
 
 
 def export_features_as_individual_kml(
@@ -432,8 +504,9 @@ def export_features_as_individual_kml(
     name_field: str,
     output_dir: str,
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
+    altitude_m: float = 0.0,
 ) -> List[str]:
-    """Export each feature as its own WGS84 KML file. Returns written paths."""
+    """Export each feature as a DJI Pilot 2–compatible KML. Returns KML paths."""
     written: List[str] = []
     features = list(layer.getFeatures())
     total = len(features)
@@ -443,7 +516,6 @@ def export_features_as_individual_kml(
         file_stem = sanitize_filename(str(raw_name))
         out_path = os.path.join(output_dir, f"{file_stem}.kml")
 
-        # Avoid silent overwrite collisions
         if os.path.exists(out_path):
             n = 2
             while os.path.exists(os.path.join(output_dir, f"{file_stem}_{n}.kml")):
@@ -451,48 +523,42 @@ def export_features_as_individual_kml(
             out_path = os.path.join(output_dir, f"{file_stem}_{n}.kml")
 
         geom = feat.geometry()
+        if geom is None or geom.isEmpty():
+            continue
         flat = QgsWkbTypes.flatType(geom.wkbType())
-        # DJI Pilot 2 prefers simple Polygon / LineString
+
         if QgsWkbTypes.geometryType(flat) == QgsWkbTypes.PolygonGeometry:
-            wkb_name = "Polygon"
             if QgsWkbTypes.isMultiType(flat):
-                # Take largest polygon part for a simple KML
                 polys = geom.asMultiPolygon() if hasattr(geom, "asMultiPolygon") else []
                 if polys:
-                    geom = QgsGeometry.fromPolygonXY(max(polys, key=lambda p: abs(QgsGeometry.fromPolygonXY(p).area())))
+                    geom = QgsGeometry.fromPolygonXY(
+                        max(polys, key=lambda p: abs(QgsGeometry.fromPolygonXY(p).area()))
+                    )
         elif QgsWkbTypes.geometryType(flat) == QgsWkbTypes.LineGeometry:
-            wkb_name = "LineString"
             if QgsWkbTypes.isMultiType(flat):
                 lines = geom.asMultiPolyline()
                 if lines:
                     geom = QgsGeometry.fromPolylineXY(max(lines, key=len))
         else:
-            wkb_name = QgsWkbTypes.displayString(flat)
+            continue
 
-        tmp = QgsVectorLayer(
-            f"{wkb_name}?crs={layer.crs().authid()}",
-            file_stem,
-            "memory",
-        )
-        tmp_prov = tmp.dataProvider()
-        tmp_fields = QgsFields()
-        tmp_fields.append(QgsField("Name", QVariant.String))
-        tmp_fields.append(QgsField("name", QVariant.String))
-        tmp_prov.addAttributes(tmp_fields)
-        tmp.updateFields()
+        geom_wgs = _reproject_geom_wgs84(geom, layer.crs())
+        try:
+            kml_text = build_dji_pilot_kml(str(raw_name), geom_wgs, altitude_m=altitude_m)
+        except ProcessingError:
+            # Skip degenerate clipped slivers rather than aborting the whole export
+            continue
 
-        single = QgsFeature(tmp.fields())
-        single.setGeometry(QgsGeometry(geom))
-        single.setAttribute("Name", str(raw_name))
-        single.setAttribute("name", str(raw_name))
-        tmp_prov.addFeature(single)
-        tmp.updateExtents()
-
-        _write_kml_layer(tmp, out_path, layer.crs())
+        write_dji_kml(out_path, kml_text)
         written.append(out_path)
         if progress_callback and (i % 10 == 0 or i == total):
-            progress_callback(i, total, f"Exporting KML ({i}/{total})…")
+            progress_callback(i, total, f"Exporting DJI KML ({i}/{total})…")
 
+    if not written and total:
+        raise ProcessingError(
+            "No DJI-compatible KML files were written. "
+            "Features may be too small/degenerate after clipping."
+        )
     return written
 
 

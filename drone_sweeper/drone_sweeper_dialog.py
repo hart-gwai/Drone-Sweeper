@@ -127,7 +127,8 @@ class DroneSweeperDialog(QDialog):
 
         tip = QLabel(
             "Output next to the project file:\n"
-            "Flight Plan_<polygon>/Area Search_<polygon>/  and  Linear Search_<polygon>/"
+            "Flight Plan_<polygon>/Area Search_<polygon>/  and  Linear Search_<polygon>/\n"
+            "KML is written in DJI Pilot 2–compatible format."
         )
         tip.setWordWrap(True)
         tip.setStyleSheet("color: #666; font-size: 11px;")
