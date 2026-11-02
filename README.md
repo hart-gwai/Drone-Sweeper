@@ -4,7 +4,7 @@ QGIS 3 plugin for Search and Rescue (SAR) drone flight planning.
 
 Generate **MGRS-aligned area-search grids**, pull **OSM trails/waterways**, flag **power-line hazards**, and export **DJI Pilot 2–compatible KML** (plus hazard **GPX**) beside your saved QGIS project.
 
-**Stable release:** [v1.2.1](https://github.com/hart-gwai/Drone-Sweeper/releases/tag/v1.2.1)
+**Stable release:** [v1.2.2](https://github.com/hart-gwai/Drone-Sweeper/releases/tag/v1.2.2)
 
 ## Features
 
@@ -39,7 +39,7 @@ Generate **MGRS-aligned area-search grids**, pull **OSM trails/waterways**, flag
 ## Install
 
 ### From ZIP (recommended for testers)
-1. Download [`Drone_Sweeper_v1.2.1.zip`](https://github.com/hart-gwai/Drone-Sweeper/releases/download/v1.2.1/Drone_Sweeper_v1.2.1.zip)
+1. Download [`Drone_Sweeper_v1.2.2.zip`](https://github.com/hart-gwai/Drone-Sweeper/releases/download/v1.2.2/Drone_Sweeper_v1.2.2.zip)
 2. QGIS → **Plugins → Manage and Install Plugins → Install from ZIP**
 3. Enable **Drone Sweeper**
 

@@ -813,10 +813,7 @@ def style_area_grid_layer(layer: QgsVectorLayer) -> None:
         }
     )
     layer.setRenderer(QgsSingleSymbolRenderer(symbol))
-    try:
-        _apply_xy_centroid_label(layer)
-    except Exception:
-        pass
+    _apply_xy_centroid_label(layer)
     layer.triggerRepaint()
 
 
@@ -894,18 +891,32 @@ def _apply_xy_centroid_label(layer: QgsVectorLayer) -> None:
         " ELSE 0 END"
     )
     size_prop = QgsProperty.fromExpression(size_expr)
+    prop_cls = getattr(QgsPalLayerSettings, "Property", None)
+    if prop_cls is not None and hasattr(prop_cls, "Size"):
+        size_key = prop_cls.Size
+    else:
+        size_key = QgsPalLayerSettings.Size
+
     applied_dd = False
     try:
-        settings.setDataDefinedProperty(QgsPalLayerSettings.Size, size_prop)
+        settings.setDataDefinedProperty(size_key, size_prop)
         applied_dd = True
     except Exception:
         pass
     if not applied_dd:
         try:
+            props = settings.dataDefinedProperties()
+            props.setProperty(size_key, size_prop)
+            settings.setDataDefinedProperties(props)
+            applied_dd = True
+        except Exception:
+            pass
+    if not applied_dd:
+        try:
             dd = text_format.dataDefinedProperties()
-            size_key = getattr(QgsTextFormat, "Size", None)
-            if size_key is not None:
-                dd.setProperty(size_key, size_prop)
+            fmt_size_key = getattr(QgsTextFormat, "Size", None)
+            if fmt_size_key is not None:
+                dd.setProperty(fmt_size_key, size_prop)
                 text_format.setDataDefinedProperties(dd)
         except Exception:
             pass
