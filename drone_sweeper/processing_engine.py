@@ -12,6 +12,7 @@ from typing import Callable, List, Optional, Sequence, Tuple
 from xml.sax.saxutils import escape as xml_escape
 
 from qgis.core import (
+    Qgis,
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
     QgsFeature,
@@ -812,8 +813,31 @@ def style_area_grid_layer(layer: QgsVectorLayer) -> None:
         }
     )
     layer.setRenderer(QgsSingleSymbolRenderer(symbol))
-    _apply_xy_centroid_label(layer)
+    try:
+        _apply_xy_centroid_label(layer)
+    except Exception:
+        pass
     layer.triggerRepaint()
+
+
+def _set_polygon_centroid_label_placement(settings) -> None:
+    """QGIS 3.26+ expects Qgis.LabelPlacement; older builds use QgsPalLayerSettings."""
+    label_placement = getattr(Qgis, "LabelPlacement", None)
+    if label_placement is not None:
+        try:
+            settings.placement = label_placement.OverPoint
+            return
+        except TypeError:
+            pass
+    for attr in ("OverPoint", "AroundPoint", "Centroid"):
+        val = getattr(settings.__class__, attr, None)
+        if val is None:
+            continue
+        try:
+            settings.placement = val
+            return
+        except TypeError:
+            continue
 
 
 def _apply_xy_centroid_label(layer: QgsVectorLayer) -> None:
@@ -843,11 +867,7 @@ def _apply_xy_centroid_label(layer: QgsVectorLayer) -> None:
             "regexp_substr(coalesce(\"Name\",\"name\"), '^([A-Z]+\\\\d+)')"
         )
 
-    placement = getattr(QgsPalLayerSettings, "OverPoint", None)
-    if placement is None:
-        placement = getattr(QgsPalLayerSettings, "Centroid", None)
-    if placement is not None:
-        settings.placement = placement
+    _set_polygon_centroid_label_placement(settings)
     if hasattr(settings, "centroidWhole"):
         settings.centroidWhole = True
 
