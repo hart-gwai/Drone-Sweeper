@@ -4,28 +4,26 @@ QGIS 3 plugin for Search and Rescue (SAR) drone flight planning.
 
 Generate **MGRS-aligned area-search grids**, pull **OSM trails/waterways**, flag **power-line hazards**, and export **DJI Pilot 2–compatible KML** (plus hazard **GPX**) beside your saved QGIS project.
 
-**Stable release:** [v1.1.0](https://github.com/hart-gwai/Drone-Sweeper/releases/tag/v1.1.0)
+**Stable release:** [v1.2.0](https://github.com/hart-gwai/Drone-Sweeper/releases/tag/v1.2.0)
 
 ## Features
 
 | Mode | What it does | Needs internet? |
 |------|----------------|-----------------|
-| **Area Search** | Builds a metre grid snapped to MGRS/UTM lines; exports one KML per cell; loads layers into QGIS | No (grid works offline) |
-| **Linear Search** | Fetches OSM paths/trails and waterways, clips to AOI, names unnamed features with MGRS | Yes (Overpass API) |
+| **Area Search** | Builds a metre grid snapped to MGRS/UTM lines; exports one multi-cell KML; loads layer into QGIS | No (grid works offline) |
+| **Linear Search** | Fetches OSM paths/trails and waterways, clips to AOI, exports two consolidated KMLs | Yes (Overpass API) |
 | **Potential Hazards** *(with Area Search)* | Best-effort OSM power lines & pylons → GPX + hazard symbology | Yes (skipped gracefully if offline) |
 
 ### Area Search details
 - Default cell size **100 × 100 m** (must be a **multiple of 10 m**)
-- Cell / file names: `PolygonName_A1_50Q KK 123456` (100 m / 6-digit MGRS)
+- One KML/layer: `Area Search_<polygon>.kml` with features `A1_<polygon>`, `A2_<polygon>`, … (MGRS kept as attributes)
 - Red fill at 50% opacity; **XY** labels at cell centres (shrink / hide when zoomed out)
-- Output folder: `Flight Plan_<name>/Area Search_<name>/`
 
 ### Linear Search details
 - Trails: `path`, `footway`, `track`, `steps`, `bridleway`, `cycleway`
 - Waterways: `stream`, `river`, `canal`, `drain`
-- Unnamed features → e.g. `Stream near 50Q KK 123456`
-- Thick multi-colour line symbology
-- Output folder: `Flight Plan_<name>/Linear Search_<name>/`
+- Two KMLs under `Flight Plan_<name>/`: `Paths and Trails_<name>.kml` (green), `Waterways and Streams_<name>.kml` (blue)
+- Unnamed features: `Trail1_<name>`, `Trail2_<name>`, … and `water1_<name>`, `water2_<name>`, …; **OSM `name` tags are kept when present**
 
 ### Potential Hazards
 - OSM `power=line|minor_line|cable` and `power=tower|pole|portal`
@@ -41,7 +39,7 @@ Generate **MGRS-aligned area-search grids**, pull **OSM trails/waterways**, flag
 ## Install
 
 ### From ZIP (recommended for testers)
-1. Download [`Drone_Sweeper_v1.1.0.zip`](https://github.com/hart-gwai/Drone-Sweeper/releases/download/v1.1.0/Drone_Sweeper_v1.1.0.zip)
+1. Download [`Drone_Sweeper_v1.2.0.zip`](https://github.com/hart-gwai/Drone-Sweeper/releases/download/v1.2.0/Drone_Sweeper_v1.2.0.zip)
 2. QGIS → **Plugins → Manage and Install Plugins → Install from ZIP**
 3. Enable **Drone Sweeper**
 
@@ -77,8 +75,9 @@ Restart QGIS (or use Plugin Reloader), then enable the plugin.
 ```
 <project folder>/
   Flight Plan_<AOI>/
-    Area Search_<AOI>/          # one .kml per grid cell
-    Linear Search_<AOI>/        # one .kml per linear feature
+    Area Search_<AOI>.kml
+    Paths and Trails_<AOI>.kml
+    Waterways and Streams_<AOI>.kml
     Potential Hazards/          # Power_Pylons.gpx, Power_Lines.gpx
 ```
 
@@ -95,6 +94,7 @@ drone_sweeper/           # installable QGIS plugin
   metadata.txt
   icons/
 install_to_qgis.py       # helper to copy/junction into QGIS plugins folder
+dist/                    # release ZIPs (local; not in git)
 ```
 
 ## Disclaimer
